@@ -1,0 +1,20 @@
+{
+  "name": "山海拾遗",
+  "short_name": "山海拾遗",
+  "description": "手机端弹幕天堂肉鸽。单手走位、自动开火、一局 8~12 分钟。严格不联网。",
+  "lang": "zh-CN",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "fullscreen",
+  "orientation": "landscape",
+  "background_color": "#0b0a0e",
+  "theme_color": "#0b0a0e",
+  "icons": [
+    {
+      "src": "assets/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

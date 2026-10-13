@@ -1,0 +1,95 @@
+plugins {
+    id 'com.android.application'
+}
+
+def keystorePropsFile = rootProject.file('keystore.properties')
+def keystoreProps = new Properties()
+if (keystorePropsFile.exists()) {
+    keystorePropsFile.withInputStream { keystoreProps.load(it) }
+}
+
+android {
+    namespace 'com.wuqijiangye.shanhai'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'com.wuqijiangye.shanhai'
+        // minSdk 26：本作是严格不联网的纯 Canvas 2D 游戏，
+        // 但依赖 ES2015+ 与 DOM Storage，Android 8.0(26) 起步才有稳定可用的 WebView。
+        // 需要 arm64-v8a / armeabi-v7a / x86_64 全兼容（规格 §15 TapPlay 要求）。
+        minSdk 26
+        targetSdk 35
+        versionCode 6
+        versionName '0.2.4'
+        // 所有变体都必须有这个字段（否则 MainActivity 引用 BuildConfig.DEV_ULTIMATE 会编译失败）。
+        // 默认 false = 正式行为；只有 devultimate 测试变体覆盖成 true。
+        buildConfigField "boolean", "DEV_ULTIMATE", "false"
+    }
+
+    signingConfigs {
+        release {
+            if (keystoreProps.containsKey('storeFile')) {
+                storeFile rootProject.file(keystoreProps['storeFile'])
+                storePassword keystoreProps['storePassword']
+                keyAlias keystoreProps['keyAlias']
+                keyPassword keystoreProps['keyPassword']
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            shrinkResources false
+            if (keystoreProps.containsKey('storeFile')) {
+                signingConfig signingConfigs.release
+            }
+        }
+        // 验证用变体：可调试，含 logcat 诊断与 CDP 远程调试。**不对外分发**。
+        // 平时加 .verify 后缀，**与正式包共存**（避免手机上出现两个图标一样的"山海拾遗"）。
+        // 需要覆盖正式包调试时（共享足迹、对比同一局），把下面两行注释掉重建即可。
+        debug {
+            applicationIdSuffix '.verify'
+            versionNameSuffix '-verify'
+        }
+        // 测试用变体：开局直接进入"四把武器满级 + 四合一终极融合 + 主动技能"状态。
+        // 独立包名 + 独立应用名 ⇒ **可以和正式包同时装在手机上，互不覆盖存档**。
+        // 由 build-shanhai-apk.ps1 -DevUltimate 构建。
+        devultimate {
+            initWith release
+            applicationIdSuffix '.devultimate'
+            versionNameSuffix '-devultimate'
+            signingConfig signingConfigs.release
+            resValue "string", "app_name", "山海拾遗·终极测试"
+            // 这个包里 dev 模式默认开启（MainActivity 把 ?dev=ultimate 拼到入口 URL 上）
+            buildConfigField "boolean", "DEV_ULTIMATE", "true"
+            matchingFallbacks = ['release']
+        }
+    }
+
+    // AGP 8 起 BuildConfig 默认不生成；debug 变体的诊断桥需要 BuildConfig.DEBUG
+    buildFeatures {
+        buildConfig true
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+
+    packaging {
+        resources {
+            excludes += ['META-INF/*.version']
+        }
+    }
+
+    // 游戏资源原样打进 assets，不做任何压缩转换（.js/.css/.svg/.webmanifest 必须逐字节一致）
+    androidResources {
+        noCompress 'webmanifest', 'svg'
+    }
+}

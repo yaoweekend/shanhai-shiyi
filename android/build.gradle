@@ -1,0 +1,6 @@
+// 只在根项目声明插件版本，真正的应用放在 :app 模块里
+// 说明：本项目**不引入任何第三方依赖**（包括 AndroidX），因此完全离线可构建。
+// 本地资源拦截、MIME 判定、沉浸式全屏都用平台自带 API 实现。
+plugins {
+    id 'com.android.application' version '8.7.3' apply false
+}

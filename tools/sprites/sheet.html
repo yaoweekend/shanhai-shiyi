@@ -1,0 +1,1971 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>山海拾遗 · 精灵绘图纸（batch 1 + 2）</title>
+<!--
+  ===========================================================================
+  用法（不要另找方法，这条流水线是验证过的）
+  ===========================================================================
+  1) 改下面的 SPRITES 数组（增删槽位、改画法），存盘。
+  2) 跑一键脚本（它会按槽位数自动算网格尺寸并开 Edge 无头截图）：
+
+     & .\tools\sprites\build.ps1
+
+     等价的手工命令（--window-size 必须 = COLS*CELL × ROWS*CELL，
+     当前 12 个槽位 = 3 列 × 4 行 = 768×1024）：
+
+     & "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" `
+       --headless=new --disable-gpu --no-sandbox --hide-scrollbars `
+       --default-background-color=00000000 `
+       --window-size=768,1024 `
+       --screenshot="D:\吴琦姜也\shanhai\tools\sprites\_sheet.png" `
+       "file:///D:/吴琦姜也/shanhai/tools/sprites/sheet.html"
+
+     （stderr 里的 ERROR:QQBrowser / task_manager 噪音是正常的，看有没有产出 PNG。）
+
+  3) python slice.py  —— 按单元格切片、缩放到 manifest 里的确切尺寸、
+     写进 assets/sprites/，并跑全部自检 + 生成联络表。
+
+  ===========================================================================
+  坐标约定（照着画就不会被游戏裁掉、不会偏心）
+  ===========================================================================
+  · 每个单元格 CELL×CELL（默认 256），画布 3 列 × N 行（N = ceil(槽位数 / 3)）。
+  · 单元格内部再划分出一个居中的 ART×ART（默认 200）正方形，坐标原点
+    平移到这个正方形的中心。所有绘制函数都在 [-100, +100] 的坐标系里画，
+    正右 +x、正下 +y（顶视角：屏幕上方 = 生物的前方）。
+  · 所以「居中」是构造出来的，不需要靠肉眼对齐：只要不画出 ±100，
+    就永远有留白、永远不会贴边、也不会被后续缩放拉伸（ART 是正方形）。
+  · 绘制是 4 倍超采样（32×32 的精灵在 200×200 里画，再 Lanczos 缩到 32×32），
+    所以是带抗锯齿的矢量绘制，不是点阵像素画。
+  · 颜色只能取自 src/content/series.js 的 color/accent 与
+    src/content/enemies.js 的既有配色，不要自己发明主色。
+-->
+<style>
+  html, body { margin: 0; padding: 0; background: transparent; }
+  canvas { display: block; image-rendering: auto; }
+</style>
+</head>
+<body>
+<canvas id="sheet"></canvas>
+<script>
+'use strict';
+
+// ---------------------------------------------------------------------------
+// 色板：直接抄 src/content/series.js（shan/hai/huang 的 color/accent）
+// ---------------------------------------------------------------------------
+const SERIES_INK = {
+  shan:  { main: '#c9553d', accent: '#f0b357' },
+  hai:   { main: '#2f7fb8', accent: '#7fd6ee' },
+  huang: { main: '#6f5aa8', accent: '#c39bf0' },
+  // 批 2 的三个角色（第 4~6 系），同样直接抄 src/content/series.js，不自己发明颜色
+  tian:  { main: '#d9a02b', accent: '#ffe08a' },   // 天问 · 爆发暴击
+  ling:  { main: '#2f9e8f', accent: '#8ff0dd' },   // 灵山 · 诅咒减益
+  kun:   { main: '#8a93a8', accent: '#dfe6f2' },   // 昆仑 · 守护回复
+};
+// 中性色：暗色底 + 金色/玉色描边（上古神话审美），敌方偏冷暗
+const INK = {
+  outline:  '#140f16',   // 所有生物的描边
+  rim:      '#f0b357',   // 金色描边（正面轮廓高光）
+  jade:     '#8ff0dd',   // 玉色
+  bone:     '#e8e2d0',   // 骨白
+  boneDim:  '#9a9182',
+  dark:     '#1a1015',   // 眼窝
+  blood:    '#c0392b',
+  ember:    '#ff8a4a',
+  flame:    '#ffd166',
+  flesh:    '#d9a86c',   // 兽面/虎皮
+  fleshDim: '#a9764a',
+  scaleHi:  '#cfd8ef',   // 蛇鳞冷高光
+  shadow:   'rgba(0,0,0,0.45)',
+};
+
+// ---------------------------------------------------------------------------
+// 几何 / 绘制小工具
+// ---------------------------------------------------------------------------
+function hexRGB(hex) {
+  const h = hex.replace('#', '');
+  const n = parseInt(h.length === 3 ? h.split('').map(c => c + c).join('') : h, 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+function rgba(hex, a) { const c = hexRGB(hex); return `rgba(${c[0]},${c[1]},${c[2]},${a})`; }
+function mix(a, b, t) {
+  const A = hexRGB(a), B = hexRGB(b);
+  return `rgb(${Math.round(A[0] + (B[0] - A[0]) * t)},${Math.round(A[1] + (B[1] - A[1]) * t)},${Math.round(A[2] + (B[2] - A[2]) * t)})`;
+}
+
+function poly(ctx, pts) {
+  ctx.beginPath();
+  ctx.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+  ctx.closePath();
+}
+// 以 t 为参数在 [0,1] 上取样条点（Catmull-Rom 近似，够用且稳）
+function pathThrough(ctx, pts, samples = 28) {
+  ctx.beginPath();
+  ctx.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 0; i < pts.length - 1; i++) {
+    const p0 = pts[Math.max(0, i - 1)], p1 = pts[i], p2 = pts[i + 1], p3 = pts[Math.min(pts.length - 1, i + 2)];
+    for (let s = 1; s <= samples / (pts.length - 1); s++) {
+      const t = s / (samples / (pts.length - 1));
+      const t2 = t * t, t3 = t2 * t;
+      const x = 0.5 * ((2 * p1[0]) + (-p0[0] + p2[0]) * t + (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2 + (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3);
+      const y = 0.5 * ((2 * p1[1]) + (-p0[1] + p2[1]) * t + (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2 + (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3);
+      ctx.lineTo(x, y);
+    }
+  }
+}
+// 描边填充：正文 + 统一深色描边（上古壁画感）
+function ink(ctx, fill, stroke = INK.outline, lw = 4) {
+  if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+  if (stroke && lw > 0) {
+    ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    ctx.strokeStyle = stroke; ctx.lineWidth = lw; ctx.stroke();
+  }
+}
+function disc(ctx, x, y, r, fill, stroke, lw) {
+  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2);
+  ink(ctx, fill, stroke, lw);
+}
+function capsule(ctx, x1, y1, x2, y2, w, fill, stroke, lw) {
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2);
+  if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = w + (lw || 0) * 2; ctx.stroke(); }
+  ctx.strokeStyle = fill; ctx.lineWidth = w; ctx.stroke();
+}
+// 眼：暗窝 + 亮瞳（朝向指示，永远朝屏幕上方 = 前）
+function eye(ctx, x, y, r, pupil = '#ffe08a', glow = null) {
+  disc(ctx, x, y, r, INK.dark, INK.outline, 1.6);
+  if (glow) { disc(ctx, x, y, r * 0.72, glow, null, 0); }
+  disc(ctx, x, y, r * 0.42, pupil, null, 0);
+  disc(ctx, x - r * 0.18, y - r * 0.2, r * 0.16, '#ffffff', null, 0);
+}
+// 局部坐标系里画一个"部件"（头/手/翼），绕自身中心旋转
+function part(ctx, x, y, rot, scale, fn) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(scale, scale);
+  ctx.rotate(rot);
+  fn(ctx, scale);
+  ctx.restore();
+}
+// 软阴影（贴在身体下方，给一点体积而不是浮空）
+function groundShadow(ctx, r, squash = 0.62, a = 0.4) {
+  ctx.save();
+  ctx.beginPath(); ctx.ellipse(0, r * 0.55, r * 0.92, r * 0.92 * squash, 0, 0, Math.PI * 2);
+  ctx.fillStyle = `rgba(6,5,10,${a})`; ctx.fill();
+  ctx.restore();
+}
+// 放射渐变光晕（火鸟、自爆鬼、Boss）
+function glow(ctx, x, y, r, color, a0 = 0.55) {
+  const g = ctx.createRadialGradient(x, y, r * 0.05, x, y, r);
+  g.addColorStop(0, rgba(color, a0));
+  g.addColorStop(1, rgba(color, 0));
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+}
+
+// ---------------------------------------------------------------------------
+// 三个玩家角色：同一「素体幼体」设定，靠器官轮廓区分三系
+// ---------------------------------------------------------------------------
+function baseLarva(ctx, main, accent, coreFill, coreR) {
+  // 无定形幼体：一团柔软的原生质，边缘起伏（贝塞尔）
+  const N = 13;
+  const pts = [];
+  for (let i = 0; i < N; i++) {
+    const a = -Math.PI / 2 + (i / N) * Math.PI * 2;
+    const wob = 1 + 0.13 * Math.sin(i * 2.3 + 0.7) + 0.07 * Math.cos(i * 3.7);
+    pts.push([Math.cos(a) * 62 * wob, Math.sin(a) * 58 * wob]);
+  }
+  ctx.beginPath();
+  ctx.moveTo((pts[0][0] + pts[N - 1][0]) / 2, (pts[0][1] + pts[N - 1][1]) / 2);
+  for (let i = 0; i < N; i++) {
+    const p = pts[i], q = pts[(i + 1) % N];
+    ctx.quadraticCurveTo(p[0], p[1], (p[0] + q[0]) / 2, (p[1] + q[1]) / 2);
+  }
+  ctx.closePath();
+  const g = ctx.createRadialGradient(-18, -22, 6, 0, 0, 74);
+  g.addColorStop(0, mix(main, '#ffffff', 0.34));
+  g.addColorStop(0.55, main);
+  g.addColorStop(1, mix(main, '#000000', 0.45));
+  ink(ctx, g, INK.outline, 4.5);
+  // 玉色内缘
+  ctx.save();
+  ctx.beginPath();
+  ctx.ellipse(0, 0, 60, 56, 0, 0, Math.PI * 2);
+  ctx.clip();
+  ctx.beginPath();
+  ctx.ellipse(0, 1, 56, 52, 0, 0, Math.PI * 2);
+  ctx.strokeStyle = rgba(accent, 0.5); ctx.lineWidth = 3; ctx.stroke();
+  ctx.restore();
+  // 核心（每系不同器官的"根"）
+  if (coreR > 0) {
+    const gc = ctx.createRadialGradient(0, -coreR * 0.3, coreR * 0.15, 0, 0, coreR);
+    gc.addColorStop(0, mix(coreFill, '#ffffff', 0.5));
+    gc.addColorStop(1, coreFill);
+    disc(ctx, 0, 0, coreR, gc, rgba(accent, 0.85), 2.5);
+  }
+}
+
+function drawShanpo(ctx) {
+  const S = SERIES_INK.shan;
+  groundShadow(ctx, 64, 0.6, 0.4);
+  // 山经器官：背甲（岩石板）——三块层叠的岩片，只露出中轴
+  baseLarva(ctx, S.main, S.accent, mix(S.main, '#3a1a14', 0.5), 18);
+  const plate = (w, h, y, t) => {
+    const g = ctx.createLinearGradient(0, y - h, 0, y + h);
+    g.addColorStop(0, mix(S.main, '#ffffff', 0.42));
+    g.addColorStop(0.5, mix(S.main, '#000000', 0.05));
+    g.addColorStop(1, mix(S.main, '#000000', 0.5));
+    poly(ctx, [[-w, y + h * 0.55], [0, y - h * 0.7], [w, y + h * 0.55], [w * 0.86, y + h], [0, y + h * 0.86], [-w * 0.86, y + h]]);
+    ink(ctx, g, INK.outline, 3.5);
+    // 岩纹
+    ctx.strokeStyle = rgba(S.accent, 0.4 + t * 0.25); ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(-w * 0.5, y + h * 0.25); ctx.lineTo(0, y - h * 0.35); ctx.lineTo(w * 0.5, y + h * 0.25); ctx.stroke();
+  };
+  plate(40, 20, 30, 0.0);
+  plate(47, 24, 6, 0.4);
+  plate(52, 26, -20, 0.7);
+  // 双岩角
+  part(ctx, -30, -52, -0.42, 1, (c) => {
+    poly(ctx, [[-7, 10], [0, -20], [8, 9], [1, 14]]);
+    ink(c, mix(S.accent, '#ffffff', 0.15), INK.outline, 3);
+  });
+  part(ctx, 30, -52, 0.42, 1, (c) => {
+    poly(ctx, [[-7, 10], [0, -20], [8, 9], [1, 14]]);
+    ink(c, mix(S.accent, '#ffffff', 0.15), INK.outline, 3);
+  });
+  // 前方（上方）的双目
+  eye(ctx, -13, -34, 7.5, '#ffe9b0');
+  eye(ctx, 13, -34, 7.5, '#ffe9b0');
+  // 碎石粒（底层）
+  for (const [x, y, r] of [[-46, 22, 5], [44, 30, 4.5], [-34, 44, 4], [38, -8, 4]]) {
+    poly(ctx, [[x, y - r], [x + r, y], [x, y + r], [x - r, y]]);
+    ink(ctx, mix(S.main, '#000000', 0.25), INK.outline, 2.5);
+  }
+}
+
+function drawHaipo(ctx) {
+  const S = SERIES_INK.hai;
+  groundShadow(ctx, 62, 0.62, 0.38);
+  // 海经器官：体侧四片鳍 + 两根垂须 + 水滴冠
+  const fin = (x, y, rot, flip) => {
+    part(ctx, x, y, rot, 1, (c) => {
+      const g = c.createLinearGradient(0, -26, 0, 26);
+      g.addColorStop(0, mix(S.accent, '#ffffff', 0.45));
+      g.addColorStop(1, rgba(S.main, 0.98));
+      c.beginPath();
+      c.moveTo(0, -8);
+      c.quadraticCurveTo(flip * 34, -30, flip * 48, -6);
+      c.quadraticCurveTo(flip * 32, 4, 0, 10);
+      c.closePath();
+      ink(c, g, INK.outline, 3.5);
+      c.strokeStyle = rgba(S.accent, 0.75); c.lineWidth = 1.6;
+      for (let i = 1; i <= 3; i++) {
+        c.beginPath(); c.moveTo(flip * 6, -4 + i * 3);
+        c.quadraticCurveTo(flip * 24, -14 + i * 5, flip * 40, -6 + i * 2.4);
+        c.stroke();
+      }
+    });
+  };
+  fin(-49, 6, -0.16, -1);
+  fin(49, 6, 0.16, 1);
+  fin(-42, 32, 0.5, -1);
+  fin(42, 32, -0.5, 1);
+  baseLarva(ctx, S.main, S.accent, mix(S.main, '#0d2740', 0.45), 17);
+  // 内部水囊
+  ctx.save();
+  ctx.beginPath(); ctx.ellipse(0, 6, 44, 36, 0, 0, Math.PI * 2); ctx.clip();
+  const gw = ctx.createLinearGradient(0, -30, 0, 40);
+  gw.addColorStop(0, rgba(S.accent, 0.55));
+  gw.addColorStop(1, rgba(S.accent, 0));
+  ctx.fillStyle = gw;
+  ctx.beginPath(); ctx.ellipse(0, 2, 40, 32, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+  // 两根垂须（前方）
+  capsule(ctx, -10, -56, -26, -78, 5, mix(S.accent, '#ffffff', 0.2), INK.outline, 1.6);
+  capsule(ctx, 10, -56, 26, -78, 5, mix(S.accent, '#ffffff', 0.2), INK.outline, 1.6);
+  disc(ctx, -26, -79, 4, S.accent, INK.outline, 1.6);
+  disc(ctx, 26, -79, 4, S.accent, INK.outline, 1.6);
+  // 水滴冠（区别于山魄的岩角）
+  poly(ctx, [[0, -74], [9, -60], [0, -50], [-9, -60]]);
+  ink(ctx, mix(S.accent, '#ffffff', 0.35), INK.outline, 3);
+  // 独眼（水滴状，横向）
+  ctx.save();
+  ctx.beginPath(); ctx.ellipse(1, -30, 13, 9.5, 0, 0, Math.PI * 2);
+  ink(ctx, INK.dark, INK.outline, 3);
+  disc(ctx, 1, -30, 6.4, S.accent, null, 0);
+  disc(ctx, 1, -30, 3, '#0b2033', null, 0);
+  disc(ctx, -1.4, -32, 1.7, '#ffffff', null, 0);
+  ctx.restore();
+}
+
+function drawHuangpo(ctx) {
+  const S = SERIES_INK.huang;
+  groundShadow(ctx, 60, 0.6, 0.38);
+  // 大荒经器官：周身八根荒刺 + 三道刻痕 + 悬浮碎屑
+  const spikes = [[-0.62, 0.60], [-0.30, 0.85], [0.05, 0.92], [0.40, 0.80], [0.72, 0.52], [-0.86, 0.28], [0.94, 0.20], [0.30, -0.90], [-0.34, -0.88]];
+  for (const [dx, dy] of spikes) {
+    const a = Math.atan2(dy, dx);
+    part(ctx, Math.cos(a) * 46, Math.sin(a) * 44, a + Math.PI / 2, 1, (c) => {
+      poly(ctx, [[-6, 6], [0, -26], [6, 6]]);
+      ink(c, mix(S.accent, '#000000', 0.15), INK.outline, 3);
+    });
+  }
+  baseLarva(ctx, S.main, S.accent, mix(S.main, '#1a0f2b', 0.5), 15);
+  // 刻痕三角（三只荒目）
+  part(ctx, 0, -26, 0, 1, (c) => {
+    poly(ctx, [[0, -18], [16, 12], [-16, 12]]);
+    ink(c, mix(S.accent, '#ffffff', 0.1), INK.outline, 3.5);
+    disc(c, 0, -1, 5.4, '#2a1240', null, 0);
+    disc(c, 0, -1, 2.6, S.accent, null, 0);
+  });
+  for (const [x, y] of [[-30, 20], [30, 20]]) {
+    ctx.save();
+    ctx.beginPath(); ctx.moveTo(x, y - 12); ctx.lineTo(x + 11, y + 8); ctx.lineTo(x - 11, y + 8); ctx.closePath();
+    ink(ctx, mix(S.main, '#000000', 0.35), rgba(S.accent, 0.9), 3);
+    disc(ctx, x, y + 1, 3.2, S.accent, null, 0);
+    ctx.restore();
+  }
+  // 悬浮碎屑
+  for (const [x, y, r] of [[-62, -34, 6], [64, -26, 5], [-52, 44, 5.5], [58, 46, 6], [2, 66, 4.5]]) {
+    poly(ctx, [[x, y - r], [x + r, y + r * 0.2], [x, y + r], [x - r, y + r * 0.2]]);
+    ink(ctx, rgba(S.accent, 0.9), INK.outline, 2.5);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 五个普通敌人
+// ---------------------------------------------------------------------------
+function drawShanxiao(ctx) {
+  const S = SERIES_INK.shan;
+  groundShadow(ctx, 82, 0.55, 0.45);
+  // 独脚（下方中轴，唯一支撑 → 最强的剪影特征）
+  capsule(ctx, 2, 30, 8, 86, 15, mix(S.main, '#000000', 0.5), INK.outline, 2);
+  part(ctx, 8, 92, 0, 1, (c) => {  // 脚爪（三趾）
+    for (const a of [-0.5, 0, 0.5]) {
+      part(c, 0, 0, a, 1, (cc) => { poly(cc, [[-4, 2], [0, 16], [5, 2]]); ink(cc, mix(S.accent, '#000000', 0.35), INK.outline, 2.5); });
+    }
+  });
+  // 一双超出躯干的长臂 + 指爪
+  const arm = (side) => {
+    capsule(ctx, side * 20, -6, side * 62, 20, 13, mix(S.main, '#000000', 0.28), INK.outline, 2);
+    capsule(ctx, side * 62, 20, side * 78, 50, 10, mix(S.main, '#000000', 0.2), INK.outline, 2);
+    part(ctx, side * 80, 54, side * 0.35, 1, (c) => {
+      for (const a of [-0.45, 0, 0.45]) {
+        part(c, 0, 0, a, 1, (cc) => { poly(cc, [[-3, 0], [0, 15], [4, 0]]); ink(cc, INK.bone, INK.outline, 2.2); });
+      }
+    });
+  };
+  arm(-1); arm(1);
+  // 肩部鬃毛（深色，压住手臂根部）
+  for (const side of [-1, 1]) {
+    for (let i = 0; i < 5; i++) {
+      const a = side * (0.15 + i * 0.34) - Math.PI * (side > 0 ? 0.02 : 0.02);
+      const r = 34;
+      part(ctx, side * Math.cos(a) * 0 + Math.cos(a) * r, -4 + Math.sin(a) * r * 0.7, a + Math.PI / 2, 1, (c) => {
+        poly(c, [[-6, 6], [0, -22], [6, 6]]);
+        ink(c, mix(S.main, '#000000', 0.55), INK.outline, 2.2);
+      });
+    }
+  }
+  // 猿身（椭圆，深色毛发）
+  ctx.beginPath(); ctx.ellipse(0, 6, 40, 34, 0, 0, Math.PI * 2);
+  const gb = ctx.createRadialGradient(-14, -10, 6, 0, 6, 46);
+  gb.addColorStop(0, mix(S.main, '#ffffff', 0.22));
+  gb.addColorStop(1, mix(S.main, '#000000', 0.55));
+  ink(ctx, gb, INK.outline, 5);
+  // 毛发纹理
+  ctx.strokeStyle = rgba('#000000', 0.35); ctx.lineWidth = 2.4;
+  for (let i = 0; i < 7; i++) {
+    const a = -0.4 + i * 0.55;
+    ctx.beginPath();
+    ctx.moveTo(Math.cos(a) * 20, 6 + Math.sin(a) * 18);
+    ctx.lineTo(Math.cos(a) * 40, 6 + Math.sin(a) * 33);
+    ctx.stroke();
+  }
+  // 人面（浅肉色面具，压在身体前缘）
+  const faceG = ctx.createRadialGradient(0, -46, 4, 0, -36, 30);
+  faceG.addColorStop(0, mix(INK.flesh, '#ffffff', 0.35));
+  faceG.addColorStop(1, INK.fleshDim);
+  poly(ctx, [[-21, -58], [-13, -68], [0, -72], [13, -68], [21, -58], [17, -34], [0, -27], [-17, -34]]);
+  ink(ctx, faceG, INK.outline, 4);
+  // 长眉 + 双目 + 獠牙口
+  ctx.strokeStyle = mix(S.main, '#000000', 0.6); ctx.lineWidth = 3.4; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(-16, -55); ctx.lineTo(-4, -50); ctx.moveTo(16, -55); ctx.lineTo(4, -50); ctx.stroke();
+  eye(ctx, -8, -45, 6, '#ffd166', INK.ember);
+  eye(ctx, 8, -45, 6, '#ffd166', INK.ember);
+  ctx.beginPath(); ctx.moveTo(-9, -35); ctx.quadraticCurveTo(0, -29, 9, -35);
+  ctx.strokeStyle = INK.dark; ctx.lineWidth = 3; ctx.stroke();
+  for (const x of [-6, 0, 6]) {
+    poly(ctx, [[x - 2.4, -34], [x, -27.5], [x + 2.4, -34]]);
+    ink(ctx, INK.bone, null, 0);
+  }
+}
+
+function drawBifang(ctx) {
+  const S = SERIES_INK.huang;
+  // 火鸟：暖色自发光，但主体仍属大荒经（紫金）
+  const FLAME = '#ff8a3a', HOT = '#ffd98a';
+  glow(ctx, 0, 6, 76, FLAME, 0.4);
+  groundShadow(ctx, 74, 0.5, 0.32);
+  // 尾焰（上方后方 → 屏幕上其实是后方 = 下方；顶视里"前"朝上，所以尾在后）
+  const tail = (side) => {
+    part(ctx, side * 8, 44, side * 0.34, 1, (c) => {
+      const g = c.createLinearGradient(0, 0, side * 10, 62);
+      g.addColorStop(0, rgba(HOT, 0.98));
+      g.addColorStop(0.45, rgba(FLAME, 0.9));
+      g.addColorStop(1, rgba(FLAME, 0));
+      c.beginPath();
+      c.moveTo(0, 0);
+      c.quadraticCurveTo(side * 20, 26, side * 26, 62);
+      c.quadraticCurveTo(side * 6, 40, 0, 10);
+      c.closePath();
+      c.fillStyle = g; c.fill();
+      c.strokeStyle = rgba('#7a2f10', 0.8); c.lineWidth = 2.5; c.stroke();
+    });
+  };
+  tail(-1); tail(1);
+  // 双翼（展开的火焰羽翼，带分羽）
+  const wing = (side) => {
+    part(ctx, side * 24, 2, side * 0.22, 1, (c) => {
+      const g = c.createLinearGradient(0, 0, side * 60, 24);
+      g.addColorStop(0, mix(FLAME, '#ffffff', 0.42));
+      g.addColorStop(1, mix(S.main, '#000000', 0.25));
+      c.beginPath();
+      c.moveTo(0, -14);
+      c.quadraticCurveTo(side * 40, -34, side * 70, 2);
+      c.quadraticCurveTo(side * 52, 14, side * 36, 20);
+      c.quadraticCurveTo(side * 30, 34, side * 12, 30);
+      c.closePath();
+      ink(c, g, INK.outline, 4);
+      c.strokeStyle = rgba(HOT, 0.85); c.lineWidth = 2;
+      for (let i = 0; i < 4; i++) {
+        c.beginPath();
+        c.moveTo(side * 8, -6 + i * 4);
+        c.quadraticCurveTo(side * 40, -14 + i * 9, side * 62 - i * 4, 2 + i * 6);
+        c.stroke();
+      }
+    });
+  };
+  wing(-1); wing(1);
+  // 一足（细长，中轴下方）
+  capsule(ctx, 0, 34, -2, 74, 5, mix(S.main, '#000000', 0.1), INK.outline, 2);
+  part(ctx, -2, 78, 0, 1, (c) => {
+    for (const a of [-0.6, 0, 0.6]) {
+      part(c, 0, 0, a, 1, (cc) => { poly(cc, [[-2.6, 0], [0, 13], [3, 0]]); ink(cc, HOT, INK.outline, 2.2); });
+    }
+  });
+  // 躯干（鹤形流线）
+  ctx.beginPath();
+  ctx.ellipse(0, 12, 17, 30, 0, 0, Math.PI * 2);
+  const gb = ctx.createRadialGradient(-6, 0, 4, 0, 12, 34);
+  gb.addColorStop(0, mix(HOT, '#ffffff', 0.3));
+  gb.addColorStop(0.6, FLAME);
+  gb.addColorStop(1, mix(S.main, '#000000', 0.35));
+  ink(ctx, gb, INK.outline, 4.5);
+  // 长颈 + 头
+  capsule(ctx, 0, -12, 0, -46, 12, mix(HOT, FLAME, 0.45), INK.outline, 2.4);
+  ctx.beginPath(); ctx.ellipse(0, -56, 13, 15, 0, 0, Math.PI * 2);
+  ink(ctx, mix(HOT, '#ffffff', 0.2), INK.outline, 4);
+  // 喙（前伸）
+  poly(ctx, [[-6, -66], [0, -84], [6, -66]]);
+  ink(ctx, mix(S.accent, '#000000', 0.25), INK.outline, 3);
+  // 冠羽（三根火苗）
+  for (const [dx, rot, h] of [[-5, -0.5, 20], [0, 0, 26], [5, 0.5, 20]]) {
+    part(ctx, dx, -70, rot, 1, (c) => {
+      poly(c, [[-4, 4], [0, -h], [4, 4]]);
+      ink(c, HOT, INK.outline, 2.4);
+    });
+  }
+  // 双目（鸟眼，两侧）
+  eye(ctx, -6, -58, 4.2, '#fff1c9', INK.ember);
+  eye(ctx, 6, -58, 4.2, '#fff1c9', INK.ember);
+}
+
+function drawHuashe(ctx) {
+  const S = SERIES_INK.hai;
+  groundShadow(ctx, 76, 0.5, 0.4);
+  // 蛇形：左右摆动的 S 形躯干（顶视，宽度渐细）
+  const spine = [
+    [0, 78], [-15, 54], [-22, 26], [-13, 0], [6, -18], [15, -38], [9, -58],
+  ];
+  // 用描边粗细变化近似"渐细"：分三段画
+  const seg = (pts, w, fill, lw) => {
+    pathThrough(ctx, pts);
+    ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    ctx.strokeStyle = INK.outline; ctx.lineWidth = w + lw * 2; ctx.stroke();
+    ctx.strokeStyle = fill; ctx.lineWidth = w; ctx.stroke();
+  };
+  seg(spine, 30, mix(S.main, '#000000', 0.35), 2);
+  seg(spine.slice(1, 5), 26, mix(S.main, '#000000', 0.1), 2);
+  seg(spine.slice(3), 20, mix(S.accent, S.main, 0.55), 2);
+  // 背部鳞节
+  ctx.save();
+  pathThrough(ctx, spine);
+  ctx.lineWidth = 20; ctx.strokeStyle = '#000'; ctx.lineCap = 'round';
+  ctx.restore();
+  for (const p of spine) {
+    disc(ctx, p[0], p[1], 3.2, rgba(S.accent, 0.75), null, 0);
+  }
+  // 双翼（有双翼的蛇 —— 核心辨识点）
+  const wing = (side) => {
+    part(ctx, side * 12, 6, side * 0.1, 1, (c) => {
+      const g = c.createLinearGradient(0, 0, side * 56, -10);
+      g.addColorStop(0, mix(S.accent, '#ffffff', 0.5));
+      g.addColorStop(0.6, mix(S.accent, S.main, 0.35));
+      g.addColorStop(1, rgba(S.main, 0.95));
+      c.beginPath();
+      c.moveTo(0, -12);
+      c.quadraticCurveTo(side * 30, -40, side * 62, -18);
+      c.quadraticCurveTo(side * 46, 6, side * 30, 16);
+      c.quadraticCurveTo(side * 14, 22, 0, 14);
+      c.closePath();
+      ink(c, g, INK.outline, 4);
+      c.strokeStyle = rgba('#ffffff', 0.45); c.lineWidth = 1.8;
+      for (let i = 0; i < 3; i++) {
+        c.beginPath();
+        c.moveTo(side * 8, -6 + i * 6);
+        c.quadraticCurveTo(side * 34, -22 + i * 10, side * 56, -12 + i * 9);
+        c.stroke();
+      }
+    });
+  };
+  wing(-1); wing(1);
+  // 头（细长蛇首，压在颈前）
+  part(ctx, 8, -64, 0.22, 1, (c) => {
+    c.beginPath();
+    c.moveTo(0, -18);
+    c.quadraticCurveTo(13, -12, 12, 4);
+    c.quadraticCurveTo(9, 18, 0, 20);
+    c.quadraticCurveTo(-9, 18, -12, 4);
+    c.quadraticCurveTo(-13, -12, 0, -18);
+    c.closePath();
+    const g = c.createLinearGradient(0, -18, 0, 20);
+    g.addColorStop(0, mix(S.accent, '#ffffff', 0.3));
+    g.addColorStop(1, mix(S.main, '#000000', 0.2));
+    ink(c, g, INK.outline, 3.6);
+    // 头冠双角
+    for (const s2 of [-1, 1]) {
+      part(c, s2 * 7, -14, s2 * 0.5, 1, (cc) => { poly(cc, [[-2.6, 3], [0, -11], [3, 3]]); ink(cc, S.accent, INK.outline, 2.2); });
+    }
+    eye(c, -4.5, -4, 4, '#d6f7ff', S.accent);
+    eye(c, 4.5, -4, 4, '#d6f7ff', S.accent);
+    // 信子
+    c.strokeStyle = '#ff6b8a'; c.lineWidth = 2; c.lineCap = 'round';
+    c.beginPath(); c.moveTo(0, -18); c.lineTo(0, -27); c.moveTo(0, -27); c.lineTo(-4, -32); c.moveTo(0, -27); c.lineTo(4, -32); c.stroke();
+  });
+}
+
+function drawXinang(ctx) {
+  const S = SERIES_INK.huang;
+  // 自爆引信：核心发光 + 四散火星
+  glow(ctx, 0, 4, 56, S.accent, 0.5);
+  groundShadow(ctx, 52, 0.5, 0.36);
+  // 细长垂手（从肩部垂到远超身体的下方）
+  const hand = (side) => {
+    capsule(ctx, side * 16, -8, side * 30, 44, 6.5, mix(S.main, '#000000', 0.15), INK.outline, 2);
+    capsule(ctx, side * 30, 44, side * 26, 78, 5, mix(S.main, '#000000', 0.05), INK.outline, 2);
+    for (const a of [-0.4, 0.1, 0.6]) {
+      part(ctx, side * 26, 80, side * a, 1, (c) => {
+        poly(c, [[-2.4, 0], [0, 13], [3.4, 0]]);
+        ink(c, INK.boneDim, INK.outline, 2);
+      });
+    }
+    disc(ctx, side * 16, -10, 7, mix(S.main, '#000000', 0.3), INK.outline, 2.4);
+  };
+  hand(-1); hand(1);
+  // 瘦小躯干
+  poly(ctx, [[-15, -30], [15, -30], [13, 26], [0, 36], [-13, 26]]);
+  const gb = ctx.createLinearGradient(0, -30, 0, 36);
+  gb.addColorStop(0, mix(S.main, '#ffffff', 0.3));
+  gb.addColorStop(1, mix(S.main, '#000000', 0.5));
+  ink(ctx, gb, INK.outline, 4);
+  // 肋骨（细长瘦削）
+  ctx.strokeStyle = rgba('#000000', 0.42); ctx.lineWidth = 2.2;
+  for (let i = 0; i < 4; i++) {
+    const y = -20 + i * 10;
+    ctx.beginPath(); ctx.moveTo(-11, y); ctx.quadraticCurveTo(0, y + 5, 11, y); ctx.stroke();
+  }
+  // 发光核心（引信）
+  glow(ctx, 0, -2, 30, S.accent, 0.85);
+  disc(ctx, 0, -2, 10, mix(S.accent, '#ffffff', 0.35), rgba(S.accent, 1), 3);
+  disc(ctx, 0, -2, 4.6, '#ffffff', null, 0);
+  // 大头（比躯干宽）
+  ctx.beginPath(); ctx.ellipse(0, -48, 22, 17, 0, 0, Math.PI * 2);
+  const gh = ctx.createRadialGradient(-6, -54, 4, 0, -48, 24);
+  gh.addColorStop(0, mix(S.main, '#ffffff', 0.4));
+  gh.addColorStop(1, mix(S.main, '#000000', 0.42));
+  ink(ctx, gh, INK.outline, 4);
+  // 两点凶目 + 尖牙
+  eye(ctx, -8, -50, 5, '#ffd0f0', S.accent);
+  eye(ctx, 8, -50, 5, '#ffd0f0', S.accent);
+  for (const [x, h] of [[-5, 6], [0, 8], [5, 6]]) {
+    poly(ctx, [[x - 2.2, -39], [x, -39 + h], [x + 2.2, -39]]);
+    ink(ctx, INK.bone, null, 0);
+  }
+  // 四散火星（爆炸前兆）
+  for (const [x, y, r] of [[-46, -28, 4.5], [44, -34, 4], [-38, 34, 4], [40, 30, 5], [-6, -78, 3.6], [22, 60, 3.4]]) {
+    glow(ctx, x, y, r * 2.4, S.accent, 0.5);
+    disc(ctx, x, y, r, '#fff0ff', rgba(S.accent, 0.9), 1.6);
+  }
+}
+
+function drawQiangliang(ctx) {
+  const S = SERIES_INK.shan;
+  groundShadow(ctx, 92, 0.55, 0.45);
+  // 双腿（短粗，收在下缘）
+  for (const side of [-1, 1]) {
+    capsule(ctx, side * 22, 40, side * 30, 82, 17, mix(S.main, '#000000', 0.55), INK.outline, 2.4);
+    disc(ctx, side * 31, 86, 10, mix(S.main, '#000000', 0.65), INK.outline, 3);
+  }
+  // 人类躯干（宽肩）
+  poly(ctx, [[-30, 10], [-26, -30], [0, -40], [26, -30], [30, 10], [22, 52], [0, 60], [-22, 52]]);
+  const gt = ctx.createLinearGradient(0, -40, 0, 60);
+  gt.addColorStop(0, mix(S.main, '#ffffff', 0.26));
+  gt.addColorStop(0.55, mix(S.main, '#000000', 0.12));
+  gt.addColorStop(1, mix(S.main, '#000000', 0.55));
+  ink(ctx, gt, INK.outline, 5);
+  // 胸腹肌块
+  ctx.strokeStyle = rgba('#000000', 0.3); ctx.lineWidth = 2.6;
+  ctx.beginPath(); ctx.moveTo(0, -22); ctx.lineTo(0, 44); ctx.stroke();
+  for (let i = 0; i < 3; i++) {
+    const y = -14 + i * 16;
+    ctx.beginPath(); ctx.moveTo(-14, y); ctx.quadraticCurveTo(0, y + 6, 14, y); ctx.stroke();
+  }
+  // 双臂（粗壮，外展）+ 兽爪
+  const arm = (side) => {
+    capsule(ctx, side * 25, -18, side * 62, 10, 19, mix(S.main, '#000000', 0.35), INK.outline, 2.4);
+    capsule(ctx, side * 62, 10, side * 74, 44, 14, mix(S.main, '#000000', 0.25), INK.outline, 2.4);
+    part(ctx, side * 76, 50, side * 0.4, 1, (c) => {
+      disc(c, 0, 0, 9, mix(INK.flesh, '#000000', 0.15), INK.outline, 3);
+      for (const a of [-0.5, 0, 0.5]) {
+        part(c, 0, 4, a, 1, (cc) => { poly(cc, [[-3.4, 0], [0, 17], [4.4, 0]]); ink(cc, INK.bone, INK.outline, 2.4); });
+      }
+    });
+    // 肩甲
+    part(ctx, side * 30, -22, side * 0.3, 1, (c) => {
+      poly(c, [[-14, 8], [0, -18], [15, 6], [2, 16]]);
+      ink(c, mix(S.main, '#000000', 0.5), rgba(S.accent, 0.75), 3);
+    });
+  };
+  arm(-1); arm(1);
+  // 虎首（最大、最亮的部分 —— 一眼看出是"虎首人身"）
+  const faceG = ctx.createRadialGradient(-8, -62, 4, 0, -50, 44);
+  faceG.addColorStop(0, mix(INK.flesh, '#ffffff', 0.42));
+  faceG.addColorStop(0.6, INK.flesh);
+  faceG.addColorStop(1, INK.fleshDim);
+  poly(ctx, [[-30, -44], [-34, -70], [-18, -88], [0, -92], [18, -88], [34, -70], [30, -44], [16, -36], [0, -33], [-16, -36]]);
+  ink(ctx, faceG, INK.outline, 5);
+  // 虎纹（额纹 + 颊纹）
+  ctx.strokeStyle = mix('#000000', S.main, 0.25); ctx.lineWidth = 3.6; ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(0, -88); ctx.lineTo(0, -74);
+  ctx.moveTo(-9, -85); ctx.lineTo(-13, -72);
+  ctx.moveTo(9, -85); ctx.lineTo(13, -72);
+  ctx.moveTo(-30, -62); ctx.lineTo(-19, -58);
+  ctx.moveTo(30, -62); ctx.lineTo(19, -58);
+  ctx.moveTo(-31, -52); ctx.lineTo(-20, -50);
+  ctx.moveTo(31, -52); ctx.lineTo(20, -50);
+  ctx.stroke();
+  // 颊毛（外扩的毛簇，加大头型）
+  for (const side of [-1, 1]) {
+    for (let i = 0; i < 3; i++) {
+      part(ctx, side * (32 + i * 2), -62 + i * 11, side * (0.9 + i * 0.25), 1, (c) => {
+        poly(c, [[-5, 5], [0, -16], [6, 5]]);
+        ink(c, mix(INK.flesh, '#ffffff', 0.3), INK.outline, 2.4);
+      });
+    }
+  }
+  // 虎目 + 宽口鼻
+  eye(ctx, -13, -62, 7, '#ffd166', INK.ember);
+  eye(ctx, 13, -62, 7, '#ffd166', INK.ember);
+  poly(ctx, [[-8, -50], [0, -44], [8, -50], [6, -42], [-6, -42]]);
+  ink(ctx, mix(INK.fleshDim, '#000000', 0.3), INK.outline, 2.6);
+  // 双獠牙（下缘，向上）
+  for (const side of [-1, 1]) {
+    part(ctx, side * 12, -40, side * 0.25, 1, (c) => {
+      poly(c, [[-4, 4], [0, -14], [5, 4]]);
+      ink(c, INK.bone, INK.outline, 2.4);
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Boss：相柳（九首蛇神）
+// ---------------------------------------------------------------------------
+function drawXiangliu(ctx) {
+  const S = SERIES_INK.huang;
+  // 底层盘绕的蛇身 + 毒瘴
+  glow(ctx, 0, 4, 82, '#6b3fa0', 0.55);
+  glow(ctx, 0, 4, 56, S.accent, 0.35);
+  groundShadow(ctx, 82, 0.55, 0.45);
+
+  // 盘绕的躯体：三条弧线
+  const coil = (r, w, rot, col, a) => {
+    ctx.save();
+    ctx.beginPath();
+    ctx.ellipse(0, 6, r, r * 0.72, rot, 0.15, Math.PI * 1.75);
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = rgba('#0d0714', a); ctx.lineWidth = w + 8; ctx.stroke();
+    ctx.strokeStyle = col; ctx.lineWidth = w; ctx.stroke();
+    ctx.strokeStyle = rgba(S.accent, 0.35); ctx.lineWidth = Math.max(2, w * 0.22); ctx.stroke();
+    ctx.restore();
+  };
+  coil(78, 24, 0.35, mix(S.main, '#000000', 0.25), 0.95);
+  coil(60, 21, -0.9, mix(S.main, '#000000', 0.05), 0.98);
+  coil(40, 17, 1.6, mix(S.accent, S.main, 0.5), 1);
+
+  // 九个头：环形分布，颈从中心伸出
+  // 半径必须让「头心 + 头半径 + 描边」留在 ±100 内，否则 PAD 一缩就会被裁。
+  const HEAD_R = 68, NECK_W = 14, HEADS = 9;  const headsAt = [];
+  for (let i = 0; i < HEADS; i++) {
+    const a = -Math.PI / 2 + (i / HEADS) * Math.PI * 2;
+    headsAt.push([a, Math.cos(a) * HEAD_R, Math.sin(a) * HEAD_R * 0.96]);
+  }
+  // 先画"后半圈"的颈与头
+  const drawNeck = (a, hx, hy) => {
+    const mx = Math.cos(a) * HEAD_R * 0.55 - Math.sin(a) * 16;
+    const my = Math.sin(a) * HEAD_R * 0.5 + Math.cos(a) * 16;
+    // 颈
+    pathThrough(ctx, [[Math.cos(a) * 10, Math.sin(a) * 8], [mx, my], [hx * 0.86, hy * 0.86]], 24);
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    ctx.strokeStyle = INK.outline; ctx.lineWidth = NECK_W + 6; ctx.stroke();
+    const gn = ctx.createLinearGradient(0, 0, hx, hy);
+    gn.addColorStop(0, mix(S.main, '#000000', 0.35));
+    gn.addColorStop(1, mix(S.main, '#ffffff', 0.12));
+    ctx.strokeStyle = gn; ctx.lineWidth = NECK_W; ctx.stroke();
+    // 颈鳞
+    ctx.strokeStyle = rgba(S.accent, 0.45); ctx.lineWidth = 2.4;
+    ctx.setLineDash([4, 6]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  };
+  const drawHead = (a, hx, hy, i) => {
+    part(ctx, hx, hy, a + Math.PI / 2, 1, (c) => {
+      // 蛇首：细长三角（整体尺寸收在 ±20 内，保证 9 个头的环形总幅不超界）
+      c.beginPath();
+      c.moveTo(0, -19);
+      c.quadraticCurveTo(14, -12, 13.5, 5);
+      c.quadraticCurveTo(11, 18, 0, 21);
+      c.quadraticCurveTo(-11, 18, -13.5, 5);
+      c.quadraticCurveTo(-14, -12, 0, -19);
+      c.closePath();
+      const g = c.createLinearGradient(0, -19, 0, 21);
+      g.addColorStop(0, mix(S.accent, '#ffffff', 0.35));
+      g.addColorStop(0.5, i % 2 ? mix(S.accent, S.main, 0.45) : mix(S.main, '#ffffff', 0.18));
+      g.addColorStop(1, mix(S.main, '#000000', 0.45));
+      ink(c, g, INK.outline, 4);
+      // 双角
+      for (const s2 of [-1, 1]) {
+        part(c, s2 * 8, -14, s2 * 0.55, 1, (cc) => {
+          poly(cc, [[-3, 4], [0, -13], [3.6, 4]]);
+          ink(cc, mix(S.accent, '#ffffff', 0.1), INK.outline, 2.6);
+        });
+      }
+      // 毒目（发光）
+      glow(c, -4.5, -4, 10, S.accent, 0.75);
+      glow(c, 4.5, -4, 10, S.accent, 0.75);
+      eye(c, -4.5, -4, 4.2, '#fff0a8', S.accent);
+      eye(c, 4.5, -4, 4.2, '#fff0a8', S.accent);
+      // 信子
+      c.strokeStyle = '#ff5f8a'; c.lineWidth = 2.4; c.lineCap = 'round';
+      c.beginPath();
+      c.moveTo(0, -19); c.lineTo(0, -28);
+      c.moveTo(0, -28); c.lineTo(-5, -34); c.moveTo(0, -28); c.lineTo(5, -34);
+      c.stroke();
+    });
+  };
+  for (let i = 0; i < HEADS; i++) {
+    const [a, hx, hy] = headsAt[i];
+    if (Math.sin(a) < -0.15) drawNeck(a, hx, hy); // 后半球先画颈
+  }
+  // 中央躯干（九颈汇聚的肉团）
+  ctx.beginPath(); ctx.ellipse(0, 2, 40, 36, 0, 0, Math.PI * 2);
+  const gc = ctx.createRadialGradient(-12, -10, 6, 0, 2, 46);
+  gc.addColorStop(0, mix(S.main, '#ffffff', 0.3));
+  gc.addColorStop(0.6, mix(S.main, '#000000', 0.1));
+  gc.addColorStop(1, mix(S.main, '#000000', 0.55));
+  ink(ctx, gc, INK.outline, 6);
+  // 躯干鳞甲（环形排布）
+  for (let i = 0; i < 10; i++) {
+    const a = (i / 10) * Math.PI * 2;
+    part(ctx, Math.cos(a) * 27, 2 + Math.sin(a) * 24, a + Math.PI / 2, 1, (c) => {
+      poly(c, [[-7, 6], [0, -9], [7, 6]]);
+      ink(c, rgba(S.accent, 0.75), INK.outline, 2.2);
+    });
+  }
+  // 中心毒核
+  glow(ctx, 0, 2, 30, S.accent, 0.8);
+  disc(ctx, 0, 2, 13, mix(S.accent, '#ffffff', 0.3), rgba('#ffffff', 0.7), 3);
+  disc(ctx, 0, 2, 6, '#ffffff', null, 0);
+  // 前半球：颈 + 头
+  for (let i = 0; i < HEADS; i++) {
+    const [a, hx, hy] = headsAt[i];
+    if (Math.sin(a) >= -0.15) drawNeck(a, hx, hy);
+  }
+  for (let i = 0; i < HEADS; i++) {
+    const [a, hx, hy] = headsAt[i];
+    drawHead(a, hx, hy, i);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 批 2 的三个玩家角色（第 4~6 系 · 天问/灵山/昆仑）
+// 与批 1 的三个是同一个「素体幼体」设定：都用 baseLarva 画本体、同样的深色描边
+// 与玉色内缘，只在「长出来的器官」上分系。三系的剪影必须互相不撞脸：
+//   tian 天问 · 爆发暴击 → 瘦削棱形的躯体 + 放射金光刺 + 头顶竖立天眼与冠饰
+//   ling 灵山 · 诅咒减益 → 傩面符纹 + 垂下的符纸幡 + 断续符环 + 漂浮咒粒
+//   kun  昆仑 · 守护回复 → 玉璧盾环把圆钝的本体整圈包住 + 灵芝母题
+// ---------------------------------------------------------------------------
+function drawTianpo(ctx) {
+  const S = SERIES_INK.tian;
+  // 爆发光晕（暴击系）
+  glow(ctx, 0, -8, 76, S.accent, 0.32);
+  groundShadow(ctx, 50, 0.55, 0.34);
+  // 放射状金色光刺：长短交错的尖针（"打得极疼"）
+  // 描边故意不用近黑的 INK.outline，而用深金——否则在 32px 下会读成"虫腿"
+  // 而不是"光刺"。
+  const NEEDLES = 13;
+  for (let i = 0; i < NEEDLES; i++) {
+    const a = -Math.PI / 2 + (i / NEEDLES) * Math.PI * 2 + 0.16;
+    const long = i % 2 === 0;
+    const len = long ? 56 : 46;
+    const w = long ? 5.2 : 3.8;
+    part(ctx, Math.cos(a) * 38, Math.sin(a) * 36, a + Math.PI / 2, 1, (c) => {
+      poly(c, [[-w, 9], [0, -len], [w, 9], [0, 3]]);
+      const gn = c.createLinearGradient(0, -len, 0, 9);
+      gn.addColorStop(0, mix(S.accent, '#ffffff', 0.55));
+      gn.addColorStop(0.45, mix(S.accent, S.main, 0.25));
+      gn.addColorStop(1, mix(S.main, '#000000', 0.25));
+      ink(c, gn, mix(INK.outline, S.main, 0.3), 1.8);
+    });
+  }
+  // 瘦削的躯体：仍是同一个素体幼体，横向收窄 → 尖长的棱形轮廓（"血却薄"）
+  ctx.save();
+  ctx.scale(0.74, 1.02);
+  baseLarva(ctx, S.main, S.accent, 0, 0);
+  ctx.restore();
+  // 棱形金甲：一列窄锐角的护甲片（比山魄的宽岩板更窄、更有棱角）
+  const plate = (y, w, h, hi) => {
+    poly(ctx, [[0, y - h], [w, y], [0, y + h * 0.58], [-w, y]]);
+    const g = ctx.createLinearGradient(0, y - h, 0, y + h);
+    g.addColorStop(0, mix(S.accent, '#ffffff', 0.32));
+    g.addColorStop(0.55, mix(S.main, '#ffffff', 0.06));
+    g.addColorStop(1, mix(S.main, '#000000', 0.48));
+    ink(ctx, g, INK.outline, 3);
+    ctx.strokeStyle = rgba(S.accent, 0.55 + hi * 0.35);
+    ctx.lineWidth = 1.6;
+    ctx.beginPath(); ctx.moveTo(0, y - h * 0.66); ctx.lineTo(0, y + h * 0.3); ctx.stroke();
+  };
+  plate(-4, 13, 16, 0);
+  plate(20, 16, 18, 0.4);
+  plate(42, 18, 20, 0.7);
+  // 头顶天眼：竖立的锐利杏眼（朝屏幕上方 = 前），金瞳 + 竖缝
+  ctx.save();
+  glow(ctx, 0, -44, 22, S.accent, 0.5);
+  ctx.beginPath();
+  ctx.moveTo(0, -63);
+  ctx.quadraticCurveTo(13, -44, 0, -25);
+  ctx.quadraticCurveTo(-13, -44, 0, -63);
+  ctx.closePath();
+  ink(ctx, INK.dark, INK.outline, 3.2);
+  ctx.beginPath(); ctx.ellipse(0, -44, 5.6, 13.4, 0, 0, Math.PI * 2);
+  ink(ctx, mix(S.accent, '#ffffff', 0.28), null, 0);
+  ctx.beginPath(); ctx.ellipse(0, -44, 1.8, 8.6, 0, 0, Math.PI * 2);
+  ink(ctx, '#4a3005', null, 0);
+  disc(ctx, -1.7, -50, 1.7, '#ffffff', null, 0);
+  ctx.restore();
+  // 冠饰：三根尖锐金翎（中高侧低），从天眼上方长出
+  for (const [dx, rot, h] of [[-11, -0.55, 20], [0, 0, 27], [11, 0.55, 20]]) {
+    part(ctx, dx, -62, rot, 1, (c) => {
+      poly(c, [[-4, 5], [0, -h], [4, 5]]);
+      ink(c, mix(S.accent, '#ffffff', 0.25), INK.outline, 2.6);
+    });
+  }
+}
+
+function drawWupo(ctx) {
+  const S = SERIES_INK.ling;
+  groundShadow(ctx, 66, 0.66, 0.42);
+  // 漂浮的诅咒微粒（小符环 + 亮点；画在最底层）
+  for (const [x, y, r] of [[-60, -30, 5.4], [58, -36, 4.8], [-66, 14, 4.2], [64, 18, 5.0],
+                           [-38, -64, 3.8], [42, -68, 4.0], [28, 68, 3.4], [-32, 72, 3.8]]) {
+    glow(ctx, x, y, r * 2.4, S.accent, 0.45);
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.strokeStyle = mix(S.accent, '#ffffff', 0.25); ctx.lineWidth = 2.4; ctx.stroke();
+    disc(ctx, x, y, r * 0.34, mix(S.accent, '#ffffff', 0.4), null, 0);
+  }
+  // 垂下的符纸 / 幡：让剪影整体"下坠"，与另外五系的横向展开完全不同
+  const banner = (x, y, len, rot, w) => {
+    part(ctx, x, y, rot, 1, (c) => {
+      poly(c, [[-w, 0], [w, 0], [w * 0.8, len], [0, len * 0.93], [-w * 0.8, len]]);
+      const g = c.createLinearGradient(0, 0, 0, len);
+      g.addColorStop(0, mix(S.main, '#000000', 0.05));
+      g.addColorStop(1, mix(S.main, '#000000', 0.5));
+      ink(c, g, INK.outline, 2.4);
+      // 符痕：一竖 + 三横（朱砂色，用本系强调色不另发明）
+      c.strokeStyle = rgba(S.accent, 0.95);
+      c.lineWidth = 1.7;
+      c.beginPath();
+      c.moveTo(0, len * 0.12); c.lineTo(0, len * 0.84);
+      for (let i = 1; i <= 3; i++) {
+        c.moveTo(-w * 0.55, len * (0.16 + i * 0.2));
+        c.lineTo(w * 0.55, len * (0.16 + i * 0.2));
+      }
+      c.stroke();
+    });
+  };
+  banner(-48, 6, 48, -0.18, 6.5);
+  banner(48, 6, 48, 0.18, 6.5);
+  banner(-27, 38, 40, -0.07, 6);
+  banner(27, 38, 40, 0.07, 6);
+  banner(1, 46, 34, 0, 5.5);
+  // 矮胖的躯体（"自己挪得慢"）：本体比另两系更扁更宽
+  ctx.save();
+  ctx.scale(1.04, 0.86);
+  baseLarva(ctx, S.main, S.accent, mix(S.main, '#0f3a33', 0.45), 14);
+  ctx.restore();
+  // 傩面（面具纹样）：压在本体前方，双目是细长竖缝、口是锯齿
+  const MY = -18;
+  const maskPath = () => {
+    poly(ctx, [[-30, MY - 16], [-18, MY - 30], [0, MY - 34], [18, MY - 30], [30, MY - 16],
+               [24, MY + 16], [0, MY + 26], [-24, MY + 16]]);
+  };
+  maskPath();
+  const gm = ctx.createLinearGradient(0, MY - 34, 0, MY + 26);
+  gm.addColorStop(0, mix(S.accent, '#ffffff', 0.22));
+  gm.addColorStop(0.55, mix(S.accent, S.main, 0.5));
+  gm.addColorStop(1, mix(S.main, '#000000', 0.3));
+  ink(ctx, gm, INK.outline, 3.4);
+  for (const s2 of [-1, 1]) {
+    ctx.beginPath();
+    ctx.moveTo(s2 * 14, MY - 12);
+    ctx.quadraticCurveTo(s2 * 21, MY - 1, s2 * 13, MY + 7);
+    ctx.quadraticCurveTo(s2 * 8, MY - 1, s2 * 14, MY - 12);
+    ctx.closePath();
+    ink(ctx, INK.dark, INK.outline, 1.6);
+  }
+  // 锯齿口
+  ctx.beginPath();
+  ctx.moveTo(-16, MY + 15);
+  for (let i = 0; i < 4; i++) {
+    ctx.lineTo(-16 + (i + 0.5) * 8, MY + 22);
+    ctx.lineTo(-16 + (i + 1) * 8, MY + 15);
+  }
+  ctx.strokeStyle = INK.dark; ctx.lineWidth = 2.2; ctx.lineJoin = 'miter'; ctx.stroke();
+  // 额头巫纹（额饰）
+  ctx.strokeStyle = rgba(INK.dark, 0.9); ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(0, MY - 27); ctx.lineTo(0, MY - 13);
+  ctx.moveTo(-7, MY - 22); ctx.lineTo(0, MY - 17); ctx.lineTo(7, MY - 22);
+  ctx.stroke();
+  // 缠绕的诅咒符环（断续的圈，把本体圈住）
+  ctx.save();
+  ctx.beginPath(); ctx.ellipse(0, 4, 74, 62, 0.06, 0, Math.PI * 2);
+  ctx.setLineDash([9, 11]);
+  ctx.strokeStyle = rgba(S.accent, 0.85);
+  ctx.lineWidth = 2.6;
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.restore();
+}
+
+function drawBusipo(ctx) {
+  const S = SERIES_INK.kun;
+  groundShadow(ctx, 70, 0.6, 0.4);
+  // 玉璧形的厚重盾环：把本体整圈包住（"护盾厚实"）
+  const ring = (rx, ry, w) => {
+    ctx.beginPath(); ctx.ellipse(0, 2, rx, ry, 0, 0, Math.PI * 2);
+    ctx.lineCap = 'butt';
+    ctx.strokeStyle = INK.outline; ctx.lineWidth = w + 5; ctx.stroke();
+    const g = ctx.createLinearGradient(-rx, -ry, rx, ry);
+    g.addColorStop(0, mix(S.accent, '#ffffff', 0.3));
+    g.addColorStop(0.42, mix(S.main, '#ffffff', 0.12));
+    g.addColorStop(1, mix(S.main, '#000000', 0.52));
+    ctx.strokeStyle = g; ctx.lineWidth = w; ctx.stroke();
+  };
+  ring(60, 57.6, 30);
+  // 玉璧的谷纹（环上一圈小方凸）
+  for (let i = 0; i < 12; i++) {
+    const a = (i / 12) * Math.PI * 2 + 0.13;
+    part(ctx, Math.cos(a) * 60, 2 + Math.sin(a) * 57.6, a + Math.PI / 2, 1, (c) => {
+      poly(c, [[-3.4, -3.4], [3.4, -3.4], [3.4, 3.4], [-3.4, 3.4]]);
+      ink(c, rgba(S.accent, 0.5), null, 0);
+    });
+  }
+  // 圆钝的本体（比另两系更矮胖、没有一处尖角）
+  ctx.save();
+  ctx.scale(0.86, 0.82);
+  baseLarva(ctx, S.main, S.accent, mix(S.main, '#3b4356', 0.45), 15);
+  ctx.restore();
+  // 灵芝母题（回复）：短柄 + 肾形芝盖 + 同心生长纹
+  const capPath = () => {
+    ctx.beginPath();
+    ctx.moveTo(-19, -28);
+    ctx.quadraticCurveTo(-22, -46, -2, -47);
+    ctx.quadraticCurveTo(21, -47, 19, -28);
+    ctx.quadraticCurveTo(10, -22, 0, -26);
+    ctx.quadraticCurveTo(-10, -22, -19, -28);
+    ctx.closePath();
+  };
+  capsule(ctx, 0, -13, 0, -27, 7, mix(S.main, '#000000', 0.15), INK.outline, 2);
+  const capG = ctx.createRadialGradient(-6, -40, 3, 0, -34, 24);
+  capG.addColorStop(0, mix(S.accent, '#ffffff', 0.5));
+  capG.addColorStop(0.6, mix(S.accent, S.main, 0.45));
+  capG.addColorStop(1, mix(S.main, '#000000', 0.18));
+  capPath();
+  ink(ctx, capG, INK.outline, 3.2);
+  ctx.save();
+  capPath();
+  ctx.clip();
+  ctx.strokeStyle = rgba(S.accent, 0.5);
+  ctx.lineWidth = 1.6;
+  for (let i = 1; i <= 3; i++) {
+    ctx.beginPath(); ctx.ellipse(0, -25, 5 * i, 5.5 * i, 0, 0, Math.PI * 2); ctx.stroke();
+  }
+  ctx.restore();
+  // 一双平静的小眼（冷白瞳，细长）
+  for (const s2 of [-1, 1]) {
+    ctx.beginPath(); ctx.ellipse(s2 * 10, -6, 6.4, 4.0, 0, 0, Math.PI * 2);
+    ink(ctx, INK.dark, INK.outline, 1.8);
+    disc(ctx, s2 * 10, -6, 2.4, '#eaf1ff', null, 0);
+    disc(ctx, s2 * 10 - s2 * 0.7, -7, 1.0, '#ffffff', null, 0);
+  }
+  // 盾环前方的两个圆钝护钮（"出手偏钝"：全是圆头，没有尖刺）
+  for (const s2 of [-1, 1]) {
+    part(ctx, s2 * 58, 30, s2 * 0.3, 1, (c) => {
+      disc(c, 0, 0, 12, mix(S.main, '#ffffff', 0.14), INK.outline, 3);
+      disc(c, -s2 * 3, -3, 5.4, mix(S.accent, S.main, 0.35), null, 0);
+    });
+  }
+}
+
+// ===========================================================================
+// 批 3：51 个道具图标（24 武器 + 24 被动 + 通用被动 / 超武 / 掉落）
+// ===========================================================================
+// 为什么这批要重画：批 1 的 icon_w_* 全部回退到 generator.js 里同一个四角星、
+// 被动全部回退到同一个六边形，于是三选一卡片上 24 把武器长得一模一样。
+// 这批给每个槽位画出**可表意、两两可区分**的图标。
+//
+// 绘制约定（沿用批 1/2 的同一套坐标与笔）：
+//   · 仍在 [-100, +100] 坐标系里画，主体外缘控制在 ±(78~98)，
+//     经 PAD=0.8 与 ART→24px 的缩放后约 15~19px 见方，四周留 2~4px 透明边；
+//   · 24px 太小，所以坚持「一个大剪影 + 1~2 个辨识特征」，
+//     不在里面塞细碎纹理：描边统一 7~11 单位（≈0.7~1.1px @24px）；
+//   · 配色只取 src/content/series.js 的 color/accent（外加批 1 既有的中性墨色：
+//     描边 #140f16、骨白 #e8e2d0、暗窝 #1a1015、金 #f0b357），不发明主色；
+//   · 每个图标的「色量配比」也刻意拉开（有的以主色为主、有的以强调色为主、
+//     有的掺骨白/暗色），这样既好看，也让颜色直方图这一路的撞脸检查能过。
+//
+// 形状用小 DSL 描述（见 ICON_SHAPES 的键），画法仍然是矢量 + 4 倍超采样。
+// ---------------------------------------------------------------------------
+const ICON_INK = { K: '#140f16', B: '#e8e2d0', BD: '#9a9182', W: '#ffffff', D: '#1a1015' };
+// 超武图标用「金 + 光」：金色直接取批 1 既有的描边金 INK.rim(#f0b357)，
+// 亮金取天问系的 accent(#ffe08a)，两者都在既有流水线里出现过。
+const ICON_GOLD = { main: '#f0b357', accent: '#ffe08a' };
+
+function iconPal(series) {
+  const S = (series === 'gold') ? ICON_GOLD : SERIES_INK[series];
+  return Object.assign({
+    M: S.main,
+    A: S.accent,
+    MH: mix(S.main, '#ffffff', 0.34),
+    ML: mix(S.main, '#000000', 0.46),
+    AH: mix(S.accent, '#ffffff', 0.38),
+    AL: mix(S.accent, '#000000', 0.36),
+  }, ICON_INK);
+}
+
+// ---- 小工具：把重复母题（羽/尾/芒/石）写成函数，形状本体仍是手摆的 ----
+// 锥形刃：从 (x,y) 沿角度 a 伸出 len，根部半宽 w0、尖端半宽 w1，可横向弯 bend
+function taper(x, y, a, len, w0, w1, f, s = 'K', lw = 7, bend = 0) {
+  const c = Math.cos(a), sn = Math.sin(a), nx = -sn, ny = c;
+  const tx = x + c * len + nx * bend, ty = y + sn * len + ny * bend;
+  return { k: 'poly', f, s, lw, p: [
+    [x + nx * w0, y + ny * w0], [tx + nx * w1, ty + ny * w1],
+    [tx - nx * w1, ty - ny * w1], [x - nx * w0, y - ny * w0],
+  ] };
+}
+// 月牙/弧形带：外弧 + 内弧回描，闭合成一条弯带（弓身、月轮、剑气弧都用它）
+function crescent(cx, cy, r, thick, a0, a1, steps = 22) {
+  const p = [];
+  for (let i = 0; i <= steps; i++) { const a = a0 + (a1 - a0) * i / steps; p.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r]); }
+  for (let i = steps; i >= 0; i--) { const a = a0 + (a1 - a0) * i / steps; p.push([cx + Math.cos(a) * (r - thick), cy + Math.sin(a) * (r - thick)]); }
+  return p;
+}
+function ngon(cx, cy, r, n, rot = -Math.PI / 2, ry = null) {
+  const p = [];
+  for (let i = 0; i < n; i++) {
+    const a = rot + i * Math.PI * 2 / n;
+    p.push([cx + Math.cos(a) * r, cy + Math.sin(a) * (ry || r)]);
+  }
+  return p;
+}
+// 四角星火花（极光/灵物上的小亮点）
+function spark4(x, y, r, f = 'W', s = null, lw = 0) {
+  return { k: 'poly', f, s, lw, p: [[x, y - r], [x + r * 0.3, y - r * 0.3], [x + r, y], [x + r * 0.3, y + r * 0.3],
+                                    [x, y + r], [x - r * 0.3, y + r * 0.3], [x - r, y], [x - r * 0.3, y - r * 0.3]] };
+}
+
+// ---- 形状渲染（ICON_SHAPES 的唯一解释器）----
+function paintIcon(ctx, items, P) {
+  for (const sh of items) paintIconOne(ctx, sh, P);
+}
+function icoC(P, key) { return (key === null || key === undefined) ? null : (P[key] || key); }
+function paintIconOne(ctx, sh, P) {
+  const S0 = 'K', LW = 9;
+  switch (sh.k) {
+    case 'poly':
+      poly(ctx, sh.p);
+      ink(ctx, icoC(P, sh.f === undefined ? 'M' : sh.f), icoC(P, sh.s === undefined ? S0 : sh.s), sh.lw === undefined ? LW : sh.lw);
+      break;
+    case 'grd': {
+      poly(ctx, sh.p);
+      const ys = sh.p.map(p => p[1]), xs = sh.p.map(p => p[0]);
+      const g = ctx.createLinearGradient(0, Math.min.apply(null, ys), 0, Math.max.apply(null, ys));
+      g.addColorStop(0, icoC(P, sh.c0 || 'MH'));
+      g.addColorStop(1, icoC(P, sh.c1 || 'ML'));
+      ink(ctx, g, icoC(P, sh.s === undefined ? S0 : sh.s), sh.lw === undefined ? LW : sh.lw);
+      break;
+    }
+    case 'dsc':
+      disc(ctx, sh.x, sh.y, sh.r, icoC(P, sh.f === undefined ? 'M' : sh.f), icoC(P, sh.s === undefined ? S0 : sh.s), sh.lw === undefined ? LW : sh.lw);
+      break;
+    case 'gdsc': {   // 带径向渐变的圆（宝珠/日轮）
+      const g = ctx.createRadialGradient(sh.x - sh.r * 0.3, sh.y - sh.r * 0.34, sh.r * 0.08, sh.x, sh.y, sh.r);
+      g.addColorStop(0, icoC(P, sh.c0 || 'AH'));
+      g.addColorStop(1, icoC(P, sh.c1 || 'M'));
+      disc(ctx, sh.x, sh.y, sh.r, g, icoC(P, sh.s === undefined ? S0 : sh.s), sh.lw === undefined ? LW : sh.lw);
+      break;
+    }
+    case 'ell':
+      ctx.beginPath(); ctx.ellipse(sh.x, sh.y, sh.rx, sh.ry, sh.rot || 0, 0, Math.PI * 2);
+      ink(ctx, icoC(P, sh.f === undefined ? 'M' : sh.f), icoC(P, sh.s === undefined ? S0 : sh.s), sh.lw === undefined ? LW : sh.lw);
+      break;
+    case 'cap':
+      capsule(ctx, sh.x1, sh.y1, sh.x2, sh.y2, sh.w, icoC(P, sh.f === undefined ? 'M' : sh.f), icoC(P, sh.s === undefined ? S0 : sh.s), sh.lw === undefined ? LW : sh.lw);
+      break;
+    case 'ring': {   // 整圈环（描边 + 可选虚线）
+      ctx.beginPath(); ctx.arc(sh.x, sh.y, sh.r, 0, Math.PI * 2);
+      if (sh.dash) ctx.setLineDash(sh.dash);
+      if (sh.s) { ctx.strokeStyle = icoC(P, sh.s); ctx.lineWidth = sh.w + (sh.lw || 7) * 2; ctx.stroke(); }
+      ctx.strokeStyle = icoC(P, sh.f || 'M'); ctx.lineWidth = sh.w; ctx.stroke();
+      ctx.setLineDash([]);
+      break;
+    }
+    case 'arc': {    // 部分圆弧（涡旋/风痕/露滴轨道）
+      ctx.beginPath(); ctx.arc(sh.x, sh.y, sh.r, sh.a0, sh.a1);
+      ctx.lineCap = 'round';
+      if (sh.dash) ctx.setLineDash(sh.dash);
+      if (sh.s) { ctx.strokeStyle = icoC(P, sh.s); ctx.lineWidth = sh.w + (sh.lw || 6) * 2; ctx.stroke(); }
+      ctx.strokeStyle = icoC(P, sh.f || 'M'); ctx.lineWidth = sh.w; ctx.stroke();
+      ctx.setLineDash([]);
+      break;
+    }
+    case 'cur': {    // 平滑折线：close=true 时填充成面，否则描线
+      pathThrough(ctx, sh.p, 26);
+      if (sh.close) {
+        ctx.closePath();
+        ink(ctx, icoC(P, sh.f === undefined ? 'M' : sh.f), icoC(P, sh.s === undefined ? S0 : sh.s), sh.lw === undefined ? LW : sh.lw);
+      } else {
+        ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+        if (sh.s) { ctx.strokeStyle = icoC(P, sh.s); ctx.lineWidth = sh.w + (sh.lw || 6) * 2; ctx.stroke(); }
+        ctx.strokeStyle = icoC(P, sh.f || 'M'); ctx.lineWidth = sh.w; ctx.stroke();
+      }
+      break;
+    }
+    case 'glo': {
+      // 光晕是最外圈的柔光（alpha 由内向外的渐变终止在 0），但它的外缘会一直画到 ±r。
+      // 实测：只要光晕越过作画区内缘，Lanczos 缩小到 24px 时的旁瓣就会在最外一行/列
+      // 留下 alpha 1~4，于是"四周 ≥1px 全透明"这条会挂（图标比精灵更小时更明显）。
+      // 所以这里统一把光晕收在 ±92 之内 —— 光晕本来就只是氛围，不影响造型。
+      const lim = 92;
+      const r = Math.max(16, Math.min(sh.r, lim - Math.abs(sh.x), lim - Math.abs(sh.y)));
+      glow(ctx, sh.x, sh.y, r, icoC(P, sh.c || 'A'), sh.a === undefined ? 0.35 : sh.a);
+      break;
+    }
+    case 'grp':
+      ctx.save();
+      ctx.translate(sh.x, sh.y);
+      if (sh.rot) ctx.rotate(sh.rot);
+      if (sh.sc) ctx.scale(sh.sc, sh.sc);
+      paintIcon(ctx, sh.items, P);
+      ctx.restore();
+      break;
+    default:
+      throw new Error('unknown icon shape kind: ' + sh.k);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 24 个武器图标
+// ---------------------------------------------------------------------------
+const ICON_WEAPONS = [
+  // 1 兽甲旋刃（shan · orbit）：甲环 + 环上三片刃
+  { id: 'icon_w_shoujia', cn: '兽甲旋刃', series: 'shan', sh: () => {
+    const out = [{ k: 'glo', x: 0, y: 0, r: 74, c: 'A', a: 0.32 },
+                 { k: 'ring', x: 0, y: 0, r: 58, w: 18, f: 'ML', s: 'K', lw: 8 }];
+    for (let i = 0; i < 3; i++) {
+      const a = -Math.PI / 2 + i * Math.PI * 2 / 3;
+      out.push({ k: 'grp', x: Math.cos(a) * 58, y: Math.sin(a) * 58, rot: a, items: [
+        { k: 'poly', p: [[9, -18], [36, -22], [36, 22], [9, 18]], f: 'A', s: 'K', lw: 8 }] });
+    }
+    out.push({ k: 'dsc', x: 0, y: 0, r: 24, f: 'D', s: 'K', lw: 8 });
+    out.push({ k: 'dsc', x: 0, y: 0, r: 9, f: 'AH', s: null });
+    return out;
+  } },
+  // 2 骨骸回旋（shan · boomerang）：骨制回旋镖（V 形骨 + 两端骨节）
+  { id: 'icon_w_guhai', cn: '骨骸回旋', series: 'shan', sh: () => [
+    { k: 'cap', x1: 0, y1: 44, x2: -64, y2: -44, w: 20, f: 'B', s: 'K', lw: 8 },
+    { k: 'cap', x1: 0, y1: 44, x2: 64, y2: -44, w: 20, f: 'B', s: 'K', lw: 8 },
+    { k: 'dsc', x: -70, y: -50, r: 17, f: 'B', s: 'K', lw: 8 },
+    { k: 'dsc', x: 70, y: -50, r: 17, f: 'B', s: 'K', lw: 8 },
+    { k: 'grp', x: -38, y: -24, rot: 0.96, items: [{ k: 'poly', p: [[-9, -11], [9, -11], [9, 11], [-9, 11]], f: 'M', s: 'K', lw: 7 }] },
+    { k: 'grp', x: 38, y: -24, rot: -0.96, items: [{ k: 'poly', p: [[-9, -11], [9, -11], [9, 11], [-9, 11]], f: 'M', s: 'K', lw: 7 }] },
+    { k: 'dsc', x: 0, y: 50, r: 21, f: 'M', s: 'K', lw: 8 },
+  ] },
+  // 3 利爪横扫（shan · sweep）：三道平行抓痕 + 掌后暗弧
+  { id: 'icon_w_lizhao', cn: '利爪横扫', series: 'shan', sh: () => {
+    const out = [{ k: 'ell', x: 0, y: 74, rx: 76, ry: 24, f: 'ML', s: 'K', lw: 9 }];
+    for (let i = 0; i < 3; i++) {
+      const x = -54 + i * 48;
+      out.push({ k: 'poly', p: [[x - 13, -88], [x + 11, -84], [x + 42, 62], [x + 22, 58]], f: 'A', s: 'K', lw: 7 });
+      out.push({ k: 'poly', p: [[x - 16, -94], [x + 13, -89], [x - 1, -62], [x - 24, -68]], f: 'B', s: 'K', lw: 6 });
+    }
+    return out;
+  } },
+  // 4 山崩践踏（shan · zone）：崩裂的岩板 + 下坠碎石
+  { id: 'icon_w_shanbeng', cn: '山崩践踏', series: 'shan', sh: () => [
+    { k: 'poly', p: [[-92, 64], [-58, 12], [58, 12], [92, 64]], f: 'ML', s: 'K', lw: 10 },
+    { k: 'cur', p: [[0, 14], [-24, 36], [8, 50], [-8, 64]], w: 9, f: 'K', s: null },
+    { k: 'grd', p: [[-58, -20], [-24, -40], [-16, 4], [-46, 12]], c0: 'MH', c1: 'ML', s: 'K', lw: 8 },
+    { k: 'grd', p: [[-14, -70], [24, -78], [34, -30], [4, -20]], c0: 'MH', c1: 'ML', s: 'K', lw: 8 },
+    { k: 'grd', p: [[44, -30], [72, -44], [80, 2], [50, 10]], c0: 'A', c1: 'AL', s: 'K', lw: 8 },
+    { k: 'dsc', x: -74, y: 42, r: 12, f: 'A', s: 'K', lw: 6 },
+  ] },
+  // 5 鳞雨散射（hai · projectile）：扇开的鳞片雨
+  { id: 'icon_w_linyu', cn: '鳞雨散射', series: 'hai', sh: () => {
+    const out = [{ k: 'glo', x: 0, y: -40, r: 78, c: 'A', a: 0.3 }];
+    const spec = [[-0.72, 30], [-0.36, 26], [0, 24], [0.36, 26], [0.72, 30]];
+    for (const [dx, r] of spec) {
+      out.push({ k: 'grp', x: dx * 88, y: 20 + Math.abs(dx) * 30, rot: dx, items: [
+        { k: 'poly', p: [[0, -r], [r * 0.82, 0], [0, r], [-r * 0.82, 0]], f: 'AH', s: 'K', lw: 7 }] });
+    }
+    out.push({ k: 'dsc', x: 0, y: -62, r: 21, f: 'M', s: 'K', lw: 8 });
+    out.push({ k: 'dsc', x: -58, y: 44, r: 13, f: 'M', s: 'K', lw: 7 });
+    out.push({ k: 'dsc', x: 62, y: 38, r: 12, f: 'AL', s: 'K', lw: 6 });
+    return out;
+  } },
+  // 6 鲛珠追踪（hai · projectile）：发光的珍珠 + 追踪轨道
+  { id: 'icon_w_jiaozhu', cn: '鲛珠追踪', series: 'hai', sh: () => [
+    { k: 'glo', x: 0, y: 0, r: 84, c: 'A', a: 0.5 },
+    { k: 'arc', x: 0, y: 0, r: 78, a0: -0.5, a1: 4.2, w: 8, f: 'A', s: 'K', lw: 4, dash: [11, 13] },
+    { k: 'gdsc', x: 0, y: 0, r: 48, c0: 'AH', c1: 'M', s: 'K', lw: 10 },
+    { k: 'dsc', x: -15, y: -17, r: 13, f: 'W', s: null },
+    { k: 'dsc', x: 33, y: 33, r: 9, f: 'AH', s: 'K', lw: 5 },
+    { k: 'dsc', x: -52, y: 52, r: 7, f: 'AH', s: 'K', lw: 4 },
+  ] },
+  // 7 鲸息贯穿（hai · beam）：鲸喷水柱 + 顶部散沫 + 底尾
+  { id: 'icon_w_jingxi', cn: '鲸息贯穿', series: 'hai', sh: () => {
+    const out = [{ k: 'glo', x: 0, y: -30, r: 76, c: 'A', a: 0.34 },
+                 { k: 'cap', x1: 0, y1: 56, x2: 0, y2: -30, w: 32, f: 'MH', s: 'K', lw: 9 },
+                 { k: 'poly', p: [[-34, -16], [34, -16], [40, -50], [-40, -50]], f: 'A', s: 'K', lw: 9 }];
+    for (const [dx, dy, r] of [[-62, -66, 15], [-32, -80, 13], [2, -88, 16], [36, -76, 12], [64, -60, 14]]) {
+      out.push({ k: 'grp', x: dx, y: dy, rot: dx * 0.012, items: [
+        { k: 'poly', p: [[0, -r * 1.7], [r, -r * 0.1], [0, r], [-r, -r * 0.1]], f: 'AH', s: 'K', lw: 6 }] });
+    }
+    out.push(taper(0, 52, 0.62, 44, 17, 6, 'ML', 'K', 8));
+    out.push(taper(0, 52, 2.52, 44, 17, 6, 'ML', 'K', 8));
+    return out;
+  } },
+  // 8 海茅穿刺（hai · sweep）：斜握的三叉海茅
+  { id: 'icon_w_haimao', cn: '海茅穿刺', series: 'hai', sh: () => {
+    const a = -1.368;
+    return [
+      { k: 'glo', x: 16, y: -32, r: 58, c: 'A', a: 0.3 },
+      { k: 'cap', x1: -30, y1: 74, x2: 10, y2: -34, w: 14, f: 'B', s: 'K', lw: 7 },
+      { k: 'grp', x: -22, y: 52, rot: a + Math.PI / 2, items: [{ k: 'poly', p: [[-19, -7], [19, -7], [19, 7], [-19, 7]], f: 'M', s: 'K', lw: 6 }] },
+      { k: 'grp', x: -13, y: 24, rot: a + Math.PI / 2, items: [{ k: 'poly', p: [[-17, -6], [17, -6], [17, 6], [-17, 6]], f: 'M', s: 'K', lw: 6 }] },
+      taper(10, -34, a, 58, 12, 4, 'AH', 'K', 7),
+      taper(10, -34, a - 0.62, 46, 10, 4, 'A', 'K', 7),
+      taper(10, -34, a + 0.62, 46, 10, 4, 'A', 'K', 7),
+      { k: 'poly', p: [[8, -30], [30, -46], [18, -26]], f: 'A', s: 'K', lw: 6 },
+      { k: 'arc', x: -40, y: 42, r: 28, a0: 0.6, a1: 3.0, w: 9, f: 'A', s: 'K', lw: 5 },
+    ];
+  } },
+  // 9 荒雷落顶（huang · strike）：乌云 + 劈下的闪电
+  { id: 'icon_w_huanglei', cn: '荒雷落顶', series: 'huang', sh: () => [
+    { k: 'glo', x: 0, y: -14, r: 68, c: 'A', a: 0.4 },
+    { k: 'dsc', x: -46, y: -62, r: 21, f: 'ML', s: 'K', lw: 8 },
+    { k: 'dsc', x: 2, y: -68, r: 25, f: 'ML', s: 'K', lw: 8 },
+    { k: 'dsc', x: 48, y: -60, r: 20, f: 'ML', s: 'K', lw: 8 },
+    { k: 'grd', p: [[26, -56], [-16, 4], [8, 4], [-24, 86], [30, 0], [4, 0], [34, -56]], c0: 'AH', c1: 'A', s: 'K', lw: 9 },
+    { k: 'poly', p: [[-74, -28], [-38, -16], [-64, 2]], f: 'A', s: 'K', lw: 6 },
+    { k: 'poly', p: [[76, -22], [42, -6], [70, 10]], f: 'A', s: 'K', lw: 6 },
+    { k: 'arc', x: 0, y: 92, r: 44, a0: Math.PI * 1.16, a1: Math.PI * 1.84, w: 10, f: 'ML', s: 'K', lw: 6 },
+  ] },
+  // 10 瘴气毒雾（huang · zone）：翻卷的毒雾团 + 毒泡
+  { id: 'icon_w_zhangqi', cn: '瘴气毒雾', series: 'huang', sh: () => [
+    { k: 'glo', x: 0, y: 0, r: 86, c: 'A', a: 0.3 },
+    { k: 'dsc', x: -48, y: 10, r: 38, f: 'M', s: 'K', lw: 9 },
+    { k: 'dsc', x: 48, y: 12, r: 36, f: 'M', s: 'K', lw: 9 },
+    { k: 'dsc', x: 0, y: -20, r: 42, f: 'MH', s: 'K', lw: 9 },
+    { k: 'dsc', x: -20, y: 42, r: 32, f: 'M', s: 'K', lw: 9 },
+    { k: 'dsc', x: 22, y: 46, r: 30, f: 'M', s: 'K', lw: 9 },
+    { k: 'arc', x: 0, y: 8, r: 30, a0: 0.6, a1: 3.4, w: 9, f: 'A', s: 'K', lw: 5 },
+    { k: 'arc', x: 0, y: 8, r: 58, a0: 3.6, a1: 6.0, w: 9, f: 'A', s: 'K', lw: 5 },
+    { k: 'dsc', x: -60, y: -54, r: 12, f: 'AH', s: 'K', lw: 6 },
+    { k: 'dsc', x: 6, y: -76, r: 16, f: 'AH', s: 'K', lw: 6 },
+    { k: 'dsc', x: 62, y: -50, r: 11, f: 'AH', s: 'K', lw: 6 },
+  ] },
+  // 11 召引荒兽（huang · summon）：兽首图腾 + 召唤符点
+  { id: 'icon_w_zhaoyin', cn: '召引荒兽', series: 'huang', sh: () => [
+    { k: 'glo', x: 0, y: 0, r: 86, c: 'A', a: 0.28 },
+    { k: 'poly', p: [[-40, -52], [40, -52], [46, 72], [-46, 72]], f: 'ML', s: 'K', lw: 10 },
+    { k: 'poly', p: [[-30, -46], [-64, -76], [-70, -30], [-40, -22]], f: 'A', s: 'K', lw: 8 },
+    { k: 'poly', p: [[30, -46], [64, -76], [70, -30], [40, -22]], f: 'A', s: 'K', lw: 8 },
+    { k: 'dsc', x: -19, y: 0, r: 14, f: 'D', s: 'K', lw: 6 },
+    { k: 'dsc', x: -19, y: 0, r: 6, f: 'AH', s: null },
+    { k: 'dsc', x: 19, y: 0, r: 14, f: 'D', s: 'K', lw: 6 },
+    { k: 'dsc', x: 19, y: 0, r: 6, f: 'AH', s: null },
+    { k: 'poly', p: [[-30, 32], [-16, 32], [-16, 54], [-23, 44], [-30, 54]], f: 'B', s: 'K', lw: 6 },
+    { k: 'poly', p: [[30, 32], [16, 32], [16, 54], [23, 44], [30, 54]], f: 'B', s: 'K', lw: 6 },
+    { k: 'poly', p: [[-80, -14], [-70, -24], [-60, -14], [-70, -4]], f: 'A', s: 'K', lw: 5 },
+    { k: 'poly', p: [[80, -14], [70, -24], [60, -14], [70, -4]], f: 'A', s: 'K', lw: 5 },
+    { k: 'poly', p: [[-78, 52], [-70, 42], [-62, 52], [-70, 62]], f: 'A', s: 'K', lw: 5 },
+    { k: 'poly', p: [[78, 52], [70, 42], [62, 52], [70, 62]], f: 'A', s: 'K', lw: 5 },
+  ] },
+  // 12 大荒风眼（huang · zone）：螺旋风眼
+  { id: 'icon_w_dahuangfeng', cn: '大荒风眼', series: 'huang', sh: () => [
+    { k: 'glo', x: 0, y: 0, r: 92, c: 'A', a: 0.3 },
+    { k: 'arc', x: 0, y: 0, r: 78, a0: -0.4, a1: 4.4, w: 15, f: 'M', s: 'K', lw: 8 },
+    { k: 'arc', x: 0, y: 0, r: 54, a0: 0.5, a1: 5.6, w: 14, f: 'ML', s: 'K', lw: 8 },
+    { k: 'arc', x: 0, y: 0, r: 32, a0: 1.2, a1: 6.4, w: 12, f: 'A', s: 'K', lw: 7 },
+    { k: 'dsc', x: 0, y: 0, r: 16, f: 'D', s: 'K', lw: 7 },
+    { k: 'dsc', x: 0, y: 0, r: 7, f: 'AH', s: null },
+  ] },
+  // 13 日珥箭（tian · projectile）：拖焰的箭
+  { id: 'icon_w_rijian', cn: '日珥箭', series: 'tian', sh: () => [
+    { k: 'glo', x: -24, y: 24, r: 58, c: 'A', a: 0.44 },
+    { k: 'cap', x1: -56, y1: 68, x2: 34, y2: -46, w: 14, f: 'B', s: 'K', lw: 7 },
+    { k: 'poly', p: [[24, -40], [66, -84], [46, -26]], f: 'AH', s: 'K', lw: 8 },
+    { k: 'poly', p: [[-56, 60], [-80, 78], [-58, 82]], f: 'M', s: 'K', lw: 6 },
+    { k: 'poly', p: [[-46, 74], [-70, 92], [-48, 92]], f: 'M', s: 'K', lw: 6 },
+    taper(-56, 68, 2.42, 30, 14, 3, 'A', 'K', 6),
+    taper(-46, 76, 2.72, 26, 11, 3, 'AL', 'K', 6),
+    { k: 'dsc', x: 62, y: -26, r: 10, f: 'W', s: null },
+  ] },
+  // 14 极光追魂（tian · projectile）：极光飘带 + 追踪光点
+  { id: 'icon_w_jiguang', cn: '极光追魂', series: 'tian', sh: () => [
+    { k: 'glo', x: 0, y: 0, r: 94, c: 'A', a: 0.26 },
+    { k: 'cur', p: [[-80, 46], [-40, 6], [2, 28], [44, -14], [80, -44]], w: 20, f: 'M', s: 'K', lw: 7 },
+    { k: 'cur', p: [[-80, 2], [-38, -38], [4, -16], [46, -56], [80, -74]], w: 15, f: 'A', s: 'K', lw: 6 },
+    { k: 'cur', p: [[-74, 78], [-32, 50], [10, 66], [50, 32], [76, 12]], w: 13, f: 'AL', s: 'K', lw: 6 },
+    spark4(-16, -68, 15), spark4(34, 48, 12), spark4(58, -28, 11),
+  ] },
+  // 15 日月双环（tian · zone）：日轮（带芒）与月轮并置
+  { id: 'icon_w_riyue', cn: '日月双环', series: 'tian', sh: () => {
+    const out = [{ k: 'glo', x: -20, y: -12, r: 68, c: 'A', a: 0.36 }];
+    for (let i = 0; i < 10; i++) {
+      const a = i * Math.PI * 2 / 10 + 0.2;
+      out.push({ k: 'grp', x: -20 + Math.cos(a) * 48, y: -12 + Math.sin(a) * 48, rot: a, items: [
+        { k: 'poly', p: [[0, -9], [22, -3], [22, 3], [0, 9]], f: 'A', s: 'K', lw: 5 }] });
+    }
+    out.push({ k: 'gdsc', x: -20, y: -12, r: 46, c0: 'AH', c1: 'M', s: 'K', lw: 10 });
+    out.push({ k: 'poly', p: crescent(44, 30, 46, 30, -1.3, 1.5), f: 'B', s: 'K', lw: 9 });
+    out.push({ k: 'dsc', x: 60, y: 52, r: 8, f: 'W', s: null });
+    return out;
+  } },
+  // 16 天极贯日（tian · beam）：横贯日轮的金色长矛
+  { id: 'icon_w_tianji', cn: '天极贯日', series: 'tian', sh: () => {
+    const out = [{ k: 'glo', x: 0, y: 0, r: 90, c: 'A', a: 0.34 }];
+    for (let i = 0; i < 8; i++) {
+      const a = i * Math.PI / 4 + 0.39;
+      out.push({ k: 'grp', x: Math.cos(a) * 56, y: Math.sin(a) * 56, rot: a, items: [
+        { k: 'poly', p: [[0, -8], [22, -3], [22, 3], [0, 8]], f: 'A', s: 'K', lw: 5 }] });
+    }
+    out.push({ k: 'gdsc', x: 0, y: 0, r: 54, c0: 'AH', c1: 'M', s: 'K', lw: 10 });
+    out.push({ k: 'cap', x1: -84, y1: 0, x2: 52, y2: 0, w: 15, f: 'B', s: 'K', lw: 7 });
+    out.push({ k: 'poly', p: [[48, -17], [88, 0], [48, 17]], f: 'AH', s: 'K', lw: 8 });
+    out.push({ k: 'poly', p: [[-84, -16], [-62, 0], [-84, 16]], f: 'M', s: 'K', lw: 6 });
+    out.push({ k: 'dsc', x: 0, y: 0, r: 15, f: 'W', s: null });
+    return out;
+  } },
+  // 17 巫蛊引（ling · projectile）：蛊罐 + 爬出的蛊虫
+  { id: 'icon_w_wugu', cn: '巫蛊引', series: 'ling', sh: () => [
+    { k: 'glo', x: 0, y: -60, r: 70, c: 'A', a: 0.42 },
+    { k: 'ell', x: 0, y: 18, rx: 46, ry: 50, f: 'M', s: 'K', lw: 10 },
+    { k: 'poly', p: [[-22, -26], [22, -26], [17, -58], [-17, -58]], f: 'ML', s: 'K', lw: 9 },
+    { k: 'ell', x: 0, y: -58, rx: 27, ry: 11, f: 'A', s: 'K', lw: 8 },
+    { k: 'ell', x: 30, y: -74, rx: 16, ry: 11, rot: -0.25, f: 'D', s: 'K', lw: 6 },
+    { k: 'cap', x1: 20, y1: -82, x2: 12, y2: -92, w: 4, f: 'A', s: null },
+    { k: 'cap', x1: 40, y1: -82, x2: 48, y2: -92, w: 4, f: 'A', s: null },
+    { k: 'arc', x: 0, y: 22, r: 62, a0: 0.8, a1: 2.9, w: 8, f: 'A', s: 'K', lw: 5, dash: [12, 10] },
+    { k: 'dsc', x: -62, y: 44, r: 12, f: 'A', s: 'K', lw: 6 },
+  ] },
+  // 18 蚀骨蛊（ling · projectile）：被啃噬的骨头 + 蛊虫
+  // 第一版把虫画成近黑的暗窝色（D），和骨头自身的深描边混成一团 —— 24px 下成了"一坨"。
+  // 改成：骨头用骨白、虫身用中间调的暗主色（ML）+ 玉色头足，咬痕用玉色暗调（AL）。
+  { id: 'icon_w_shigu', cn: '蚀骨蛊', series: 'ling', sh: () => [
+    { k: 'glo', x: 0, y: 0, r: 80, c: 'A', a: 0.28 },
+    { k: 'cap', x1: -42, y1: 10, x2: 42, y2: -10, w: 26, f: 'B', s: 'K', lw: 8 },
+    { k: 'dsc', x: -48, y: -12, r: 17, f: 'B', s: 'K', lw: 7 },
+    { k: 'dsc', x: -48, y: 20, r: 17, f: 'B', s: 'K', lw: 7 },
+    { k: 'dsc', x: 48, y: -22, r: 17, f: 'B', s: 'K', lw: 7 },
+    { k: 'dsc', x: 48, y: 10, r: 17, f: 'B', s: 'K', lw: 7 },
+    { k: 'dsc', x: -6, y: -18, r: 11, f: 'AL', s: 'K', lw: 4 },
+    { k: 'dsc', x: 20, y: 8, r: 9, f: 'AL', s: 'K', lw: 4 },
+    { k: 'ell', x: -24, y: -36, rx: 17, ry: 12, rot: -0.15, f: 'ML', s: 'K', lw: 6 },
+    { k: 'dsc', x: -36, y: -40, r: 7, f: 'A', s: 'K', lw: 4 },
+    { k: 'ell', x: 28, y: 32, rx: 16, ry: 11, rot: 0.15, f: 'ML', s: 'K', lw: 6 },
+    { k: 'dsc', x: 16, y: 36, r: 7, f: 'A', s: 'K', lw: 4 },
+    { k: 'cap', x1: -12, y1: -44, x2: -4, y2: -54, w: 5, f: 'A', s: null },
+    { k: 'cap', x1: 38, y1: 26, x2: 46, y2: 16, w: 5, f: 'A', s: null },
+  ] },
+  // 19 十巫幡（ling · summon）：立杆大幡（与被动「十巫幡」的横排小幡构图不同）
+  { id: 'icon_w_shiwu', cn: '十巫幡', series: 'ling', sh: () => [
+    { k: 'glo', x: 10, y: -10, r: 84, c: 'A', a: 0.26 },
+    { k: 'cap', x1: -62, y1: 86, x2: -62, y2: -72, w: 11, f: 'B', s: 'K', lw: 7 },
+    { k: 'dsc', x: -62, y: -76, r: 11, f: 'A', s: 'K', lw: 7 },
+    { k: 'poly', p: [[-54, -62], [78, -50], [78, 34], [-54, 22]], f: 'M', s: 'K', lw: 10 },
+    { k: 'cap', x1: -42, y1: -40, x2: 66, y2: -30, w: 9, f: 'A', s: 'K', lw: 4 },
+    { k: 'cap', x1: -42, y1: -16, x2: 66, y2: -6, w: 9, f: 'A', s: 'K', lw: 4 },
+    { k: 'cap', x1: -42, y1: 8, x2: 66, y2: 18, w: 9, f: 'A', s: 'K', lw: 4 },
+    { k: 'cur', p: [[-60, -74], [-82, -60], [-74, -38]], w: 9, f: 'A', s: 'K', lw: 5 },
+    { k: 'arc', x: 40, y: 50, r: 34, a0: -0.6, a1: 0.8, w: 8, f: 'A', s: 'K', lw: 5 },
+  ] },
+  // 20 灵雾噬魂（ling · zone）：上升的噬魂灵雾 + 鬼面
+  { id: 'icon_w_lingwu', cn: '灵雾噬魂', series: 'ling', sh: () => {
+    const out = [{ k: 'glo', x: 0, y: -6, r: 76, c: 'A', a: 0.32 },
+                 { k: 'dsc', x: -44, y: 54, r: 32, f: 'ML', s: 'K', lw: 9 },
+                 { k: 'dsc', x: 44, y: 54, r: 30, f: 'ML', s: 'K', lw: 9 },
+                 { k: 'dsc', x: 0, y: 62, r: 28, f: 'M', s: 'K', lw: 9 }];
+    for (const [x, bend] of [[-62, -16], [-26, -9], [26, 9], [62, 16]]) {
+      out.push({ k: 'cur', p: [[x * 0.5, 44], [x, 6], [x * 0.74 + bend, -44], [x * 0.52 + bend, -84]], w: 14, f: 'M', s: 'K', lw: 6 });
+    }
+    out.push({ k: 'ell', x: 0, y: 10, rx: 28, ry: 32, f: 'D', s: 'K', lw: 8 });
+    out.push({ k: 'dsc', x: -11, y: 2, r: 7, f: 'AH', s: null });
+    out.push({ k: 'dsc', x: 11, y: 2, r: 7, f: 'AH', s: null });
+    out.push({ k: 'ell', x: 0, y: 30, rx: 8, ry: 11, f: 'AH', s: null });
+    return out;
+  } },
+  // 21 昆仑玉琮（kun · projectile）：内圆外方的玉琮
+  { id: 'icon_w_kunlun_1', cn: '昆仑玉琮', series: 'kun', sh: () => [
+    { k: 'glo', x: 0, y: 0, r: 88, c: 'A', a: 0.3 },
+    { k: 'poly', p: [[-42, -90], [42, -90], [90, -42], [90, 42], [42, 90], [-42, 90], [-90, 42], [-90, -42]], f: 'M', s: 'K', lw: 11 },
+    { k: 'dsc', x: 0, y: 0, r: 38, f: 'D', s: 'K', lw: 9 },
+    { k: 'ring', x: 0, y: 0, r: 38, w: 8, f: 'AH', s: null },
+    { k: 'cap', x1: -72, y1: -34, x2: 72, y2: -34, w: 7, f: 'AL', s: null },
+    { k: 'cap', x1: -72, y1: 34, x2: 72, y2: 34, w: 7, f: 'AL', s: null },
+  ] },
+  // 22 悬圃垂露（kun · strike）：悬空的园圃 + 垂落的露珠
+  { id: 'icon_w_kunlun_2', cn: '悬圃垂露', series: 'kun', sh: () => {
+    const out = [{ k: 'glo', x: 0, y: 24, r: 78, c: 'A', a: 0.3 },
+                 { k: 'poly', p: [[-80, -52], [80, -52], [66, -28], [-66, -28]], f: 'M', s: 'K', lw: 10 },
+                 { k: 'poly', p: [[-66, -28], [66, -28], [40, -12], [-40, -12]], f: 'ML', s: 'K', lw: 9 }];
+    for (const [x, len] of [[-52, 24], [-2, 28], [46, 22]]) {
+      out.push(taper(x, -52, -Math.PI / 2, len, 9, 2, 'A', 'K', 5));
+    }
+    for (const [x, y, r] of [[-38, 16, 20], [2, 38, 24], [42, 10, 17]]) {
+      out.push({ k: 'poly', p: [[x, y - r * 2.0], [x + r * 0.95, y - r * 0.2], [x, y + r], [x - r * 0.95, y - r * 0.2]], f: 'AH', s: 'K', lw: 7 });
+      out.push({ k: 'dsc', x: x - r * 0.25, y: y - r * 0.5, r: r * 0.22, f: 'W', s: null });
+    }
+    out.push({ k: 'poly', p: [[-8, 72 - 9 * 2.0], [-8 + 9, 72 - 2], [-8, 72 + 9], [-8 - 9, 72 - 2]], f: 'A', s: 'K', lw: 6 });
+    return out;
+  } },
+  // 23 昆吾剑气（kun · sweep）：长剑 + 上方气刃弧
+  { id: 'icon_w_kunlun_3', cn: '昆吾剑气', series: 'kun', sh: () => [
+    { k: 'glo', x: 0, y: -20, r: 86, c: 'A', a: 0.3 },
+    { k: 'poly', p: crescent(-4, -16, 78, 24, -2.45, -0.7), f: 'A', s: 'K', lw: 7 },
+    { k: 'poly', p: crescent(4, -16, 62, 20, -2.45, -0.7), f: 'AL', s: 'K', lw: 6 },
+    { k: 'poly', p: [[-15, -84], [15, -84], [11, 28], [-11, 28]], f: 'MH', s: 'K', lw: 9 },
+    { k: 'poly', p: [[0, -92], [7, -78], [-7, -78]], f: 'A', s: 'K', lw: 5 },
+    { k: 'cap', x1: -42, y1: 32, x2: 42, y2: 32, w: 13, f: 'M', s: 'K', lw: 8 },
+    { k: 'cap', x1: 0, y1: 38, x2: 0, y2: 72, w: 14, f: 'ML', s: 'K', lw: 8 },
+    { k: 'dsc', x: 0, y: 80, r: 13, f: 'A', s: 'K', lw: 7 },
+  ] },
+  // 24 开明守御（kun · zone）：守御法阵 + 盾面宝珠
+  { id: 'icon_w_kunlun_4', cn: '开明守御', series: 'kun', sh: () => {
+    const out = [{ k: 'glo', x: 0, y: 0, r: 92, c: 'A', a: 0.3 },
+                 { k: 'poly', p: [[0, -88], [-66, -56], [-54, 44], [0, 88], [54, 44], [66, -56]], f: 'M', s: 'K', lw: 11 },
+                 { k: 'ring', x: 0, y: 0, r: 54, w: 9, f: 'AL', s: 'K', lw: 5, dash: [10, 9] }];
+    for (let i = 0; i < 6; i++) {
+      const a = -Math.PI / 2 + i * Math.PI / 3;
+      out.push({ k: 'poly', p: ngon(Math.cos(a) * 54, Math.sin(a) * 54, 9, 4, 0), f: 'A', s: 'K', lw: 5 });
+    }
+    out.push({ k: 'gdsc', x: 0, y: 0, r: 30, c0: 'AH', c1: 'M', s: 'K', lw: 9 });
+    out.push({ k: 'dsc', x: 0, y: 0, r: 12, f: 'W', s: null });
+    return out;
+  } },
+];
+
+// ---------------------------------------------------------------------------
+// 24 个被动图标
+// ---------------------------------------------------------------------------
+const ICON_PASSIVES = [
+  // ===========================================================================
+  // 被动图标 v2（重画）
+  // ---------------------------------------------------------------------------
+  // 为什么要重画（实测，不是审美）：v1 的 24 张全是「居中的圆钝徽记 + 一圈柔光」，
+  // 缩到卡片上的 44px 后剪影几乎重合 —— 两两 Jaccard 平均只有 0.366、最差一对
+  // 0.121（武器那 24 张是 0.443，玩家没抱怨过）。v2 的判据是几何的，不是"我觉得"：
+  //   · 每一张画成**那个物件的强剪影**（龟甲就是甲片、弓就是弓+箭、门阙就是双柱）；
+  //   · 24 张的**体量分布**刻意错开：横扁 / 竖长 / 斜向 / 分块留缝 / 带凹口，
+  //     不再让每一张都填满同一个居中的圆；
+  //   · 柔光（glo）压到 r ≤ 46 / a ≤ 0.20 且只落在实心主体内部。
+  //     v1 的 r≈90、a≈0.3 柔光在 44px 下等于给**每一张**外面套了一个半径约 72
+  //     的同款圆盘 —— 那正是"24 张像同一个图案"的主因（缩略图里柔光比图形还大）。
+  // ===========================================================================
+
+  // 1 玄龟甲：一只趴着的玄龟 —— 扁甲片（六角鳞分格）+ 前伸的头 + 四只外撑的短足 + 尾尖。
+  //    第一版只画了"一整块宽扁甲"，44px 下就是一坨实心宽块，和「蛊母皿」的宽浅皿撞到
+  //    0.204（最危险的一对）。改成四肢外撑、甲片收窄后，剪影变成"甲 + 6 个外凸"，
+  //    与一切"一整块"的图（皿、矿石、瓶）都能分开。
+  { id: 'icon_passive_xuangui', cn: '玄龟甲', series: 'shan', sh: () => {
+    const out = [];
+    out.push({ k: 'cap', x1: -48, y1: 22, x2: -78, y2: 32, w: 14, f: 'ML', s: 'K', lw: 5 });
+    out.push({ k: 'cap', x1: 48, y1: 22, x2: 78, y2: 32, w: 14, f: 'ML', s: 'K', lw: 5 });
+    out.push({ k: 'cap', x1: -42, y1: 34, x2: -66, y2: 56, w: 13, f: 'ML', s: 'K', lw: 5 });
+    out.push({ k: 'cap', x1: 42, y1: 34, x2: 66, y2: 56, w: 13, f: 'ML', s: 'K', lw: 5 });
+    out.push({ k: 'poly', p: [[-9, 42], [0, 66], [9, 42]], f: 'ML', s: 'K', lw: 6 });
+    out.push({ k: 'cap', x1: 0, y1: -40, x2: 0, y2: -60, w: 13, f: 'ML', s: 'K', lw: 6 });
+    out.push({ k: 'ell', x: 0, y: -72, rx: 15, ry: 12, f: 'M', s: 'K', lw: 7 });
+    out.push({ k: 'dsc', x: -5.5, y: -74, r: 3.4, f: 'AH', s: null });
+    out.push({ k: 'dsc', x: 5.5, y: -74, r: 3.4, f: 'AH', s: null });
+    out.push({ k: 'poly',
+      p: [[-62, 6], [-44, -38], [-14, -46], [14, -46], [44, -38], [62, 6], [46, 40], [0, 46], [-46, 40]],
+      f: 'M', s: 'K', lw: 10 });
+    for (let i = -1; i <= 1; i++) {
+      out.push({ k: 'poly', p: ngon(i * 26, -22 + Math.abs(i) * 8, 14, 6, 0.5), f: 'ML', s: 'AL', lw: 3 });
+      out.push({ k: 'poly', p: ngon(i * 26, 20 - Math.abs(i) * 3, 13, 6, 0.5), f: 'ML', s: 'AL', lw: 3 });
+    }
+    return out;
+  } },
+
+  // 2 夔牛蹄：偶蹄蹄印 —— 底缘被一道又深又宽的 V 楔形缝劈成两瓣（唯一"底边开口"的剪影）
+  { id: 'icon_passive_kuiniu', cn: '夔牛蹄', series: 'shan', sh: () => [
+    { k: 'poly', p: [[-62, -68], [62, -68], [78, 2], [62, 72], [26, 72], [0, -14], [-26, 72], [-62, 72], [-78, 2]],
+      f: 'MH', s: 'K', lw: 10 },
+    { k: 'poly', p: [[-44, -56], [44, -56], [52, -20], [-52, -20]], f: 'A', s: 'K', lw: 7 },
+    { k: 'poly', p: [[-58, -18], [58, -18], [46, 26], [-46, 26]], f: 'ML', s: 'K', lw: 7 },
+    { k: 'dsc', x: -88, y: 34, r: 10, f: 'BD', s: 'K', lw: 6 },
+    { k: 'dsc', x: 88, y: 34, r: 10, f: 'BD', s: 'K', lw: 6 },
+  ] },
+
+  // 3 山岳脊：锯齿连峰 —— 顶缘全是尖角、底边一整条（与"宽扁甲片"正好互为倒影）
+  { id: 'icon_passive_shanyueji', cn: '山岳脊', series: 'shan', sh: () => [
+    { k: 'poly', p: [[-92, 62], [-72, 6], [-54, 32], [-30, -38], [-8, 8], [16, -74], [38, -8], [58, -34], [78, 12], [92, 62]],
+      f: 'ML', s: 'K', lw: 9 },
+    { k: 'poly', p: [[16, -74], [3, -44], [24, -50], [33, -32]], f: 'B', s: 'K', lw: 5 },
+    { k: 'poly', p: [[-30, -38], [-41, -14], [-24, -19], [-16, -6]], f: 'B', s: 'K', lw: 5 },
+    { k: 'cap', x1: -86, y1: 62, x2: 86, y2: 62, w: 12, f: 'M', s: 'K', lw: 8 },
+  ] },
+
+  // 4 当康牙：一根粗壮獠牙（唯一的斜向长弧锥：左下牙根 → 右上翘起）
+  { id: 'icon_passive_dangkangya', cn: '当康牙', series: 'shan', sh: () => [
+    taper(-48, 74, -0.912, 190, 30, 6, 'B', 'K', 9, -22),
+    { k: 'ell', x: -50, y: 72, rx: 30, ry: 22, rot: -0.5, f: 'M', s: 'K', lw: 8 },
+    { k: 'cur', p: [[-42, 60], [-8, 20], [24, -24], [46, -62]], w: 6, f: 'BD', s: 'K', lw: 2 },
+    { k: 'poly', p: [[-88, 40], [-76, 28], [-64, 40], [-76, 52]], f: 'A', s: 'K', lw: 5 },
+    spark4(52, -78, 12), spark4(80, -36, 10),
+  ] },
+
+  // 5 九尾尾：九条散开的细尾（基部窄、上端全开 —— 唯一的"低填充扇形"）
+  { id: 'icon_passive_jiuweiyi', cn: '九尾尾', series: 'hai', sh: () => {
+    const out = [];
+    const by = 58;
+    for (let i = 0; i < 9; i++) {
+      const a = -Math.PI / 2 + (i - 4) * 0.30;
+      const len = 134 - Math.abs(i - 4) * 13;
+      out.push(taper(0, by, a, len, 12, 3.5, i % 2 ? 'A' : 'M', 'K', 7, i % 2 ? 11 : -11));
+    }
+    out.push({ k: 'ell', x: 0, y: 66, rx: 32, ry: 24, f: 'ML', s: 'K', lw: 9 });
+    out.push({ k: 'dsc', x: 0, y: 62, r: 12, f: 'A', s: 'K', lw: 5 });
+    return out;
+  } },
+
+  // 6 鲲鹏翼：一只横扫的巨翼（翼根在右下、翼尖在左上，后缘四道分羽缺口 ——
+  //   对角线与「当康牙」相反，避免两张斜向图撞剪影）
+  { id: 'icon_passive_kunpengyi', cn: '鲲鹏翼', series: 'hai', sh: () => [
+    { k: 'poly', p: [[72, 78], [30, 34], [-6, -8], [-44, -44], [-86, -66], [-64, -34], [-50, -30], [-70, -8],
+                     [-40, -2], [-58, 20], [-22, 22], [-34, 52], [4, 46], [18, 84]],
+      f: 'ML', s: 'K', lw: 9 },
+    { k: 'poly', p: [[-30, 6], [-9, 2], [-25, 22], [-45, 24]], f: 'A', s: 'K', lw: 5 },
+    { k: 'poly', p: [[-6, -30], [16, -30], [6, -12], [-14, -10]], f: 'A', s: 'K', lw: 5 },
+    { k: 'dsc', x: 62, y: 68, r: 20, f: 'M', s: 'K', lw: 9 },
+  ] },
+
+  // 7 蜃楼珠：塔状楼阁 + 珠（斜向构图：楼在左上、珠在右下，两段之间留缝）
+  { id: 'icon_passive_shenglouzhu', cn: '蜃楼珠', series: 'hai', sh: () => [
+    { k: 'glo', x: 38, y: 52, r: 40, c: 'A', a: 0.22 },
+    { k: 'poly', p: [[-48, -86], [-8, -86], [4, -68], [-58, -68]], f: 'AL', s: 'K', lw: 7 },
+    { k: 'poly', p: [[-40, -66], [-14, -66], [-8, -44], [-46, -44]], f: 'ML', s: 'K', lw: 7 },
+    { k: 'poly', p: [[-68, -46], [12, -46], [-4, -26], [-60, -26]], f: 'A', s: 'K', lw: 8 },
+    { k: 'poly', p: [[-56, -24], [-2, -24], [-10, 2], [-52, 2]], f: 'M', s: 'K', lw: 8 },
+    { k: 'poly', p: [[-66, 4], [4, 4], [-14, 20], [-58, 20]], f: 'A', s: 'K', lw: 8 },
+    { k: 'cap', x1: -28, y1: -82, x2: -28, y2: -74, w: 8, f: 'AH', s: 'K', lw: 4 },
+    { k: 'gdsc', x: 38, y: 52, r: 29, c0: 'AH', c1: 'M', s: 'K', lw: 9 },
+    { k: 'dsc', x: 29, y: 42, r: 8, f: 'W', s: null },
+    { k: 'arc', x: 66, y: 12, r: 14, a0: 2.6, a1: 4.4, w: 7, f: 'AL', s: 'K', lw: 4 },
+    { k: 'arc', x: 24, y: 66, r: 16, a0: -1.3, a1: 0.5, w: 7, f: 'AL', s: 'K', lw: 4 },
+  ] },
+
+  // 8 鲛人泪：横贯全宽的杏仁眼 + 垂落的泪（宽扁、下端只有右侧一颗泪）
+  { id: 'icon_passive_jiaorenyan', cn: '鲛人泪', series: 'hai', sh: () => [
+    { k: 'poly', p: [[-92, -26], [-52, -56], [0, -62], [52, -56], [92, -26], [52, 4], [0, 10], [-52, 4]],
+      f: 'B', s: 'K', lw: 10 },
+    { k: 'dsc', x: 0, y: -26, r: 25, f: 'AH', s: 'K', lw: 7 },
+    { k: 'ell', x: 0, y: -26, rx: 8, ry: 21, f: 'D', s: null },
+    { k: 'dsc', x: -13, y: -40, r: 6, f: 'W', s: null },
+    { k: 'cap', x1: -60, y1: -60, x2: -76, y2: -74, w: 8, f: 'A', s: 'K', lw: 4 },
+    { k: 'cap', x1: 60, y1: -60, x2: 76, y2: -74, w: 8, f: 'A', s: 'K', lw: 4 },
+    { k: 'poly', p: [[44, 18], [70, 52], [44, 88], [18, 52]], f: 'A', s: 'K', lw: 9 },
+    { k: 'dsc', x: 38, y: 46, r: 6, f: 'W', s: null },
+  ] },
+
+  // 9 烛龙瞳：竖长的细缝瞳 + 上端一簇烛火（最窄的高瘦剪影，宽仅 ±32）
+  { id: 'icon_passive_zhulongtong', cn: '烛龙瞳', series: 'huang', sh: () => [
+    { k: 'glo', x: 0, y: -6, r: 40, c: 'A', a: 0.20 },
+    { k: 'poly', p: [[0, -74], [26, -46], [32, 0], [24, 46], [0, 76], [-24, 46], [-32, 0], [-26, -46]],
+      f: 'M', s: 'K', lw: 9 },
+    { k: 'ell', x: 0, y: 2, rx: 9, ry: 52, f: 'D', s: null },
+    { k: 'ell', x: 0, y: 2, rx: 4, ry: 34, f: 'AH', s: null },
+    { k: 'poly', p: [[0, -96], [16, -78], [10, -68], [-10, -68], [-16, -78]], f: 'AH', s: 'K', lw: 7 },
+    { k: 'poly', p: [[0, -88], [7, -78], [0, -70], [-7, -78]], f: 'W', s: null },
+  ] },
+
+  // 10 祝融烬：一堆余烬（下半 2/3 的炭块）+ 顶上两簇火苗
+  { id: 'icon_passive_zhurongjin', cn: '祝融烬', series: 'huang', sh: () => {
+    const out = [{ k: 'glo', x: 0, y: 14, r: 44, c: 'A', a: 0.20 }];
+    out.push({ k: 'poly', p: [[-86, 34], [-58, -6], [-30, 22], [-36, 62], [-74, 70]], f: 'M', s: 'K', lw: 9 });
+    out.push({ k: 'poly', p: [[-30, 24], [2, -6], [30, 26], [16, 60], [-18, 58]], f: 'MH', s: 'K', lw: 9 });
+    out.push({ k: 'poly', p: [[26, 30], [58, 4], [86, 40], [66, 68], [36, 62]], f: 'ML', s: 'K', lw: 9 });
+    out.push({ k: 'poly', p: [[-16, -16], [12, -30], [24, 2], [0, 12], [-18, 2]], f: 'M', s: 'K', lw: 8 });
+    out.push({ k: 'poly', p: [[-4, -30], [10, -72], [22, -34], [16, -14], [-8, -14]], f: 'AH', s: 'K', lw: 7 });
+    out.push({ k: 'poly', p: [[2, -34], [10, -62], [18, -34]], f: 'W', s: null });
+    out.push({ k: 'poly', p: [[34, -6], [46, -38], [56, -8], [44, 2]], f: 'A', s: 'K', lw: 6 });
+    out.push({ k: 'dsc', x: -66, y: 30, r: 8, f: 'A', s: 'K', lw: 5 });
+    out.push({ k: 'dsc', x: 70, y: 24, r: 7, f: 'A', s: 'K', lw: 5 });
+    return out;
+  } },
+
+  // 11 穷奇嗅：横放的兽爪（掌垫在左、四个趾垫在右上，彼此分离）+ 三道风痕在右
+  { id: 'icon_passive_qiongqixiu', cn: '穷奇嗅', series: 'huang', sh: () => {
+    const out = [];
+    out.push({ k: 'arc', x: -6, y: -8, r: 88, a0: -0.58, a1: 0.30, w: 10, f: 'AL', s: 'K', lw: 5 });
+    out.push({ k: 'arc', x: -4, y: 24, r: 66, a0: -0.44, a1: 0.24, w: 9, f: 'AL', s: 'K', lw: 5 });
+    out.push({ k: 'arc', x: -4, y: 54, r: 46, a0: -0.32, a1: 0.20, w: 9, f: 'AL', s: 'K', lw: 5 });
+    out.push({ k: 'ell', x: -34, y: 30, rx: 40, ry: 30, rot: -0.5, f: 'M', s: 'K', lw: 9 });
+    for (const [x, y, r] of [[18, -6, 19], [42, 20, 18], [32, 52, 16], [-2, 66, 15]]) {
+      out.push({ k: 'dsc', x, y, r, f: 'M', s: 'K', lw: 8 });
+    }
+    return out;
+  } },
+
+  // 12 巴蛇吞：向右大张的上下颚（中间一整块镂空 —— 24 张里唯一的"开口大缺口"）
+  { id: 'icon_passive_bashetun', cn: '巴蛇吞', series: 'huang', sh: () => [
+    { k: 'poly', p: [[-92, -6], [-64, -40], [-16, -46], [4, -20], [0, 26], [-22, 44], [-70, 32]],
+      f: 'M', s: 'K', lw: 10 },
+    { k: 'poly', p: [[-4, -22], [52, -54], [88, -28], [40, -6], [4, 6]], f: 'ML', s: 'K', lw: 9 },
+    { k: 'poly', p: [[2, 32], [46, 24], [88, 46], [68, 78], [18, 66], [-4, 52]], f: 'ML', s: 'K', lw: 9 },
+    { k: 'dsc', x: -44, y: -12, r: 9, f: 'D', s: 'K', lw: 5 },
+    { k: 'dsc', x: -44, y: -12, r: 4, f: 'AH', s: null },
+    { k: 'poly', p: [[14, -8], [24, 14], [33, -4]], f: 'B', s: 'K', lw: 5 },
+    { k: 'poly', p: [[40, 6], [50, 26], [58, 8]], f: 'B', s: 'K', lw: 5 },
+  ] },
+
+  // 13 后羿弓：弓弧 + 弦 + 横穿的箭（唯一"整块镂空"的环形剪影）
+  { id: 'icon_passive_houyigong', cn: '后羿弓', series: 'tian', sh: () => [
+    { k: 'poly', p: crescent(-16, 0, 80, 26, -1.09, 1.09), f: 'M', s: 'K', lw: 9 },
+    { k: 'cap', x1: 4, y1: -64, x2: 4, y2: 64, w: 7, f: 'B', s: 'K', lw: 3 },
+    { k: 'cap', x1: -46, y1: 0, x2: 58, y2: 0, w: 14, f: 'B', s: 'K', lw: 8 },
+    { k: 'poly', p: [[54, -18], [92, 0], [54, 18]], f: 'AH', s: 'K', lw: 8 },
+    { k: 'poly', p: [[-46, -14], [-70, 0], [-46, 14]], f: 'ML', s: 'K', lw: 6 },
+    { k: 'poly', p: [[-22, -8], [4, -26], [-2, -2]], f: 'A', s: 'K', lw: 5 },
+  ] },
+
+  // 14 夸父踵：一只竖立的人足印（前掌 + 后跟 + 顶端五趾）+ 奔跑尘迹
+  { id: 'icon_passive_kuafuzhong', cn: '夸父踵', series: 'tian', sh: () => [
+    { k: 'ell', x: 0, y: 8, rx: 34, ry: 46, f: 'MH', s: 'K', lw: 10 },
+    { k: 'cap', x1: 0, y1: 30, x2: 0, y2: 44, w: 24, f: 'MH', s: 'K', lw: 6 },
+    { k: 'ell', x: 0, y: 60, rx: 26, ry: 24, f: 'M', s: 'K', lw: 9 },
+    { k: 'dsc', x: -28, y: -44, r: 12, f: 'M', s: 'K', lw: 7 },
+    { k: 'dsc', x: -8, y: -54, r: 12, f: 'M', s: 'K', lw: 7 },
+    { k: 'dsc', x: 13, y: -56, r: 11, f: 'M', s: 'K', lw: 7 },
+    { k: 'dsc', x: 31, y: -50, r: 10, f: 'M', s: 'K', lw: 7 },
+    { k: 'dsc', x: 45, y: -36, r: 9, f: 'M', s: 'K', lw: 6 },
+    { k: 'cap', x1: -58, y1: 74, x2: -76, y2: 86, w: 8, f: 'AL', s: 'K', lw: 3 },
+    { k: 'cap', x1: 60, y1: 72, x2: 78, y2: 84, w: 8, f: 'AL', s: 'K', lw: 3 },
+  ] },
+
+  // 15 女娲石：一块带崩口的多面矿石 + 两块崩落碎屑（唯一的"多边形矿石"）
+  { id: 'icon_passive_nvwashi', cn: '女娲石', series: 'tian', sh: () => [
+    { k: 'glo', x: 4, y: 6, r: 44, c: 'A', a: 0.18 },
+    { k: 'grd', p: [[-76, -26], [-30, -74], [26, -66], [72, -18], [58, 22], [18, 6], [34, 62], [-20, 76], [-66, 40]],
+      c0: 'MH', c1: 'ML', s: 'K', lw: 10 },
+    { k: 'poly', p: [[-58, -22], [-28, -58], [-8, -40], [-32, -6]], f: 'A', s: 'K', lw: 5 },
+    { k: 'poly', p: [[24, -58], [62, -18], [40, -6], [10, -34]], f: 'AH', s: 'K', lw: 5 },
+    { k: 'poly', p: [[-2, 26], [24, 14], [30, 56], [-14, 66]], f: 'B', s: 'K', lw: 5 },
+    spark4(-78, -52, 12), spark4(76, 44, 10),
+  ] },
+
+  // 16 精卫喙：斜向右上的尖喙（实心楔形）+ 喙尖衔着的圆石
+  { id: 'icon_passive_jingweiwei', cn: '精卫喙', series: 'tian', sh: () => [
+    { k: 'ell', x: -64, y: 26, rx: 30, ry: 34, rot: -0.3, f: 'M', s: 'K', lw: 9 },
+    { k: 'poly', p: [[-60, -6], [54, -54], [60, -36], [4, 10], [-40, 44], [-62, 38]], f: 'A', s: 'K', lw: 9 },
+    { k: 'cur', p: [[-56, 4], [-4, -12], [48, -38]], w: 6, f: 'ML', s: 'K', lw: 3 },
+    { k: 'dsc', x: -54, y: 12, r: 8, f: 'D', s: 'K', lw: 5 },
+    { k: 'dsc', x: -54, y: 10, r: 3.4, f: 'W', s: null },
+    { k: 'poly', p: ngon(70, -62, 21, 6, 0.4), f: 'BD', s: 'K', lw: 9 },
+    spark4(-88, -26, 11),
+  ] },
+
+  // 17 巫咸符：一张立起的窄长纸符（顶角折起 + 底缘燕尾开口）—— 唯一的"实心竖矩形"
+  { id: 'icon_passive_wuxianfu', cn: '巫咸符', series: 'ling', sh: () => [
+    { k: 'poly', p: [[-42, -88], [42, -88], [42, 58], [22, 84], [0, 56], [-22, 84], [-42, 58]],
+      f: 'MH', s: 'K', lw: 10 },
+    { k: 'poly', p: [[-42, -88], [-14, -88], [-42, -56]], f: 'ML', s: 'K', lw: 5 },
+    { k: 'cap', x1: -4, y1: -74, x2: -4, y2: 44, w: 9, f: 'ML', s: 'K', lw: 3 },
+    { k: 'cap', x1: -22, y1: -46, x2: 18, y2: -54, w: 8, f: 'ML', s: 'K', lw: 3 },
+    { k: 'cap', x1: -14, y1: -8, x2: 24, y2: -16, w: 8, f: 'ML', s: 'K', lw: 3 },
+    { k: 'cap', x1: -24, y1: 26, x2: 12, y2: 18, w: 8, f: 'ML', s: 'K', lw: 3 },
+    { k: 'poly', p: [[22, -80], [36, -80], [36, -64], [22, -64]], f: 'A', s: 'K', lw: 4 },
+    spark4(-72, -30, 10), spark4(74, 14, 10),
+  ] },
+
+  // 18 蛊母皿：广口浅皿 + 皿口上探出的三只虫（上端是三块分离的小剪影）
+  { id: 'icon_passive_gumumin', cn: '蛊母皿', series: 'ling', sh: () => [
+    { k: 'poly', p: [[-84, -30], [-70, 34], [0, 54], [70, 34], [84, -30]], f: 'M', s: 'K', lw: 10 },
+    { k: 'ell', x: 0, y: -30, rx: 84, ry: 20, f: 'A', s: 'K', lw: 9 },
+    { k: 'ell', x: 0, y: -32, rx: 62, ry: 12, f: 'D', s: null },
+    { k: 'cap', x1: -58, y1: 8, x2: 58, y2: 8, w: 8, f: 'AL', s: 'K', lw: 4 },
+    { k: 'ell', x: -46, y: -62, rx: 17, ry: 12, rot: -0.35, f: 'ML', s: 'K', lw: 6 },
+    { k: 'dsc', x: -60, y: -68, r: 7, f: 'A', s: 'K', lw: 4 },
+    { k: 'cap', x1: -52, y1: -74, x2: -58, y2: -86, w: 4, f: 'A', s: null },
+    { k: 'cap', x1: -42, y1: -74, x2: -36, y2: -86, w: 4, f: 'A', s: null },
+    { k: 'ell', x: 2, y: -70, rx: 18, ry: 13, f: 'ML', s: 'K', lw: 6 },
+    { k: 'dsc', x: -12, y: -76, r: 7, f: 'A', s: 'K', lw: 4 },
+    { k: 'cap', x1: -8, y1: -84, x2: -14, y2: -92, w: 4, f: 'A', s: null },
+    { k: 'cap', x1: 12, y1: -84, x2: 18, y2: -92, w: 4, f: 'A', s: null },
+    { k: 'ell', x: 50, y: -58, rx: 16, ry: 11, rot: 0.35, f: 'ML', s: 'K', lw: 6 },
+    { k: 'dsc', x: 62, y: -64, r: 7, f: 'A', s: 'K', lw: 4 },
+    { k: 'cap', x1: 56, y1: -70, x2: 62, y2: -82, w: 4, f: 'A', s: null },
+    { k: 'cap', x1: 66, y1: -70, x2: 72, y2: -82, w: 4, f: 'A', s: null },
+  ] },
+
+  // 19 灵山雾：三道横流的雾带 —— 唯一的"横条低填充"剪影。
+  //     带与带之间必须留 ≥2px 的真空隙：缩到 24px 时（1 设计单位 ≈ 0.086px）
+  //     四条 22 单位厚的带 + 波浪上下摆动会互相咬合，44px 下糊成一整块实心矩形
+  //     —— 实测那样会和「夔牛蹄」撞成 0.181。改成三条、带更薄、波幅更小。
+  { id: 'icon_passive_lingshanwu', cn: '灵山雾', series: 'ling', sh: () => {
+    const out = [];
+    const bands = [[-60, 64, 16, 'ML'], [0, 84, 17, 'M'], [60, 52, 15, 'A']];
+    for (const [y, hw, w, f] of bands) {
+      out.push({ k: 'cur', p: [[-hw, y + 7], [-hw * 0.45, y - 9], [hw * 0.42, y + 9], [hw, y - 5]], w, f, s: 'K', lw: 5 });
+    }
+    out.push(spark4(-72, 30, 9));
+    out.push(spark4(68, -30, 9));
+    return out;
+  } },
+
+  // 20 十巫幡（被动）：单杆一幡、竖长构图 —— 斜立的幡杆 + 右上一片飘动的幡布。
+  //    与武器「十巫幡」（立杆 + 横披大幡）必须明显不同，所以这里杆是斜的、
+  //    幡布只占右上角、右下与左上都是空的。
+  { id: 'icon_passive_shiwufan', cn: '十巫幡', series: 'ling', sh: () => [
+    { k: 'cap', x1: -62, y1: 86, x2: 26, y2: -82, w: 12, f: 'B', s: 'K', lw: 7 },
+    { k: 'dsc', x: -62, y: 88, r: 12, f: 'A', s: 'K', lw: 6 },
+    { k: 'dsc', x: 26, y: -84, r: 11, f: 'A', s: 'K', lw: 6 },
+    { k: 'poly', p: [[10, -76], [46, -92], [74, -74], [90, -44], [76, -12], [50, -18], [30, -40], [4, -50]],
+      f: 'M', s: 'K', lw: 9 },
+    { k: 'cap', x1: 22, y1: -60, x2: 74, y2: -52, w: 8, f: 'A', s: 'K', lw: 4 },
+    { k: 'cap', x1: 18, y1: -42, x2: 66, y2: -32, w: 8, f: 'A', s: 'K', lw: 4 },
+    { k: 'poly', p: [[62, -78], [76, -68], [60, -62], [52, -72]], f: 'AL', s: 'K', lw: 5 },
+  ] },
+
+  // 21 不死药：一颗斜置的大丹 + 一颗伴丹（圆润但斜向错位，区别于"居中的圆"）
+  { id: 'icon_passive_busiyao', cn: '不死药', series: 'kun', sh: () => [
+    { k: 'glo', x: -14, y: 12, r: 46, c: 'A', a: 0.18 },
+    { k: 'ell', x: -16, y: 14, rx: 62, ry: 50, rot: -0.42, f: 'M', s: 'K', lw: 11 },
+    { k: 'ell', x: -36, y: -8, rx: 32, ry: 21, rot: -0.42, f: 'MH', s: null },
+    { k: 'cap', x1: 16, y1: -28, x2: -50, y2: 48, w: 7, f: 'AL', s: null },
+    { k: 'ell', x: -44, y: -16, rx: 12, ry: 8, rot: -0.42, f: 'AH', s: null },
+    { k: 'gdsc', x: 62, y: -44, r: 26, c0: 'AH', c1: 'M', s: 'K', lw: 9 },
+    { k: 'dsc', x: 54, y: -52, r: 9, f: 'W', s: null },
+    { k: 'arc', x: -56, y: 56, r: 22, a0: 2.6, a1: 4.6, w: 9, f: 'AL', s: 'K', lw: 5 },
+    { k: 'arc', x: -2, y: 72, r: 26, a0: 3.1, a1: 4.8, w: 9, f: 'AL', s: 'K', lw: 5 },
+  ] },
+
+  // 22 悬圃芝：灵芝（宽扁肾形芝盖在上 + 短粗菌柄在下）—— 与"山岳脊"正好上下颠倒
+  { id: 'icon_passive_xuanpuzhi', cn: '悬圃芝', series: 'kun', sh: () => [
+    { k: 'cap', x1: 0, y1: -12, x2: 0, y2: 58, w: 34, f: 'ML', s: 'K', lw: 9 },
+    { k: 'poly', p: [[-46, 82], [46, 82], [38, 58], [-38, 58]], f: 'ML', s: 'K', lw: 8 },
+    { k: 'grd', p: [[-86, -8], [-74, -44], [-38, -68], [6, -72], [50, -60], [80, -30], [86, -2],
+                    [58, 8], [30, -6], [-2, 6], [-38, 12], [-70, 6]], c0: 'AH', c1: 'ML', s: 'K', lw: 11 },
+    { k: 'arc', x: 0, y: -34, r: 26, a0: 3.7, a1: 5.7, w: 7, f: 'AL', s: null },
+    { k: 'arc', x: 0, y: -34, r: 38, a0: 3.7, a1: 5.7, w: 7, f: 'AL', s: null },
+    spark4(-80, 40, 10), spark4(82, 28, 9),
+  ] },
+
+  // 23 昆仑玉膏：细颈玉瓶（圆腹在下 + 窄颈 + 平口 + 瓶塞）—— 唯一的"花瓶"剪影
+  { id: 'icon_passive_kunlunyu', cn: '昆仑玉膏', series: 'kun', sh: () => [
+    { k: 'ell', x: 0, y: 34, rx: 54, ry: 48, f: 'M', s: 'K', lw: 10 },
+    { k: 'cap', x1: 0, y1: -4, x2: 0, y2: -48, w: 26, f: 'ML', s: 'K', lw: 8 },
+    { k: 'ell', x: 0, y: -54, rx: 32, ry: 12, f: 'A', s: 'K', lw: 8 },
+    { k: 'dsc', x: 0, y: -72, r: 14, f: 'AH', s: 'K', lw: 7 },
+    { k: 'cap', x1: -22, y1: 26, x2: -6, y2: 44, w: 8, f: 'AH', s: null },
+    { k: 'ell', x: 0, y: 62, rx: 26, ry: 12, f: 'ML', s: 'K', lw: 7 },
+    spark4(-70, -40, 10), spark4(72, 6, 9), spark4(64, 60, 8),
+  ] },
+
+  // 24 陆吾守：双柱门阙 + 中间悬着的守护兽面（柱与面之间留两道镂空 ——
+  //    24 张里唯一的"带门洞"剪影）
+  { id: 'icon_passive_luwushou', cn: '陆吾守', series: 'kun', sh: () => [
+    { k: 'glo', x: 0, y: 8, r: 40, c: 'A', a: 0.16 },
+    { k: 'poly', p: [[-92, -88], [92, -88], [92, -58], [74, -50], [-74, -50], [-92, -58]],
+      f: 'ML', s: 'K', lw: 9 },
+    { k: 'poly', p: [[-78, -52], [-48, -52], [-48, 74], [-78, 74]], f: 'M', s: 'K', lw: 9 },
+    { k: 'poly', p: [[48, -52], [78, -52], [78, 74], [48, 74]], f: 'M', s: 'K', lw: 9 },
+    { k: 'ell', x: -63, y: 80, rx: 22, ry: 10, f: 'ML', s: 'K', lw: 7 },
+    { k: 'ell', x: 63, y: 80, rx: 22, ry: 10, f: 'ML', s: 'K', lw: 7 },
+    { k: 'poly', p: [[-34, -34], [-16, -50], [0, -40], [16, -50], [34, -34], [26, 18], [0, 34], [-26, 18]],
+      f: 'MH', s: 'K', lw: 9 },
+    { k: 'dsc', x: -13, y: -12, r: 9, f: 'D', s: 'K', lw: 4 },
+    { k: 'dsc', x: 13, y: -12, r: 9, f: 'D', s: 'K', lw: 4 },
+    { k: 'dsc', x: -13, y: -12, r: 4, f: 'AH', s: null },
+    { k: 'dsc', x: 13, y: -12, r: 4, f: 'AH', s: null },
+    { k: 'poly', p: [[-16, 8], [16, 8], [10, 20], [-10, 20]], f: 'D', s: 'K', lw: 4 },
+  ] },
+
+];
+// ---------------------------------------------------------------------------
+const ICON_EXTRA = [
+  // 通用被动（icon_passive）：中性徽记 —— 八角玉牌 + 内环 + 朝上的符纹三角
+  { id: 'icon_passive', cn: '被动图标', series: 'shan', sh: () => [
+    { k: 'glo', x: 0, y: 0, r: 88, c: 'A', a: 0.3 },
+    { k: 'poly', p: ngon(0, 0, 88, 8, Math.PI / 8), f: 'M', s: 'K', lw: 11 },
+    { k: 'ring', x: 0, y: 0, r: 56, w: 10, f: 'AL', s: 'K', lw: 5 },
+    { k: 'poly', p: [[0, -42], [38, 30], [-38, 30]], f: 'B', s: 'K', lw: 9 },
+    { k: 'dsc', x: 0, y: 8, r: 11, f: 'A', s: 'K', lw: 5 },
+    { k: 'poly', p: ngon(-64, -64, 11, 4, 0), f: 'AH', s: 'K', lw: 5 },
+    { k: 'poly', p: ngon(64, -64, 11, 4, 0), f: 'AH', s: 'K', lw: 5 },
+    { k: 'poly', p: ngon(-64, 64, 11, 4, 0), f: 'AH', s: 'K', lw: 5 },
+    { k: 'poly', p: ngon(64, 64, 11, 4, 0), f: 'AH', s: 'K', lw: 5 },
+  ] },
+  // 超武（icon_super）：金环 + 八道光芒 + 中央宝石 + 冠尖 —— 比普通图标更"贵重"
+  { id: 'icon_super', cn: '超武图标', series: 'gold', sh: () => {
+    const out = [{ k: 'glo', x: 0, y: 0, r: 96, c: 'A', a: 0.5 }];
+    for (let i = 0; i < 8; i++) out.push(taper(0, 0, -Math.PI / 2 + i * Math.PI / 4, 84, 11, 3, 'A', 'K', 6));
+    out.push({ k: 'ring', x: 0, y: 0, r: 58, w: 17, f: 'M', s: 'K', lw: 9 });
+    out.push({ k: 'poly', p: [[0, -40], [25, 0], [0, 40], [-25, 0]], f: 'W', s: 'K', lw: 8 });
+    out.push({ k: 'dsc', x: 0, y: 0, r: 9, f: 'M', s: null });
+    out.push({ k: 'poly', p: [[-34, -68], [-18, -88], [-4, -64]], f: 'M', s: 'K', lw: 6 });
+    out.push({ k: 'poly', p: [[34, -68], [18, -88], [4, -64]], f: 'M', s: 'K', lw: 6 });
+    return out;
+  } },
+  // 掉落物（12×12）：极简发光碎片 —— 12px 下只看得到一个亮核 + 四角尖。
+  // 12px 的成品是 200px 缩 16.7 倍，Lanczos 旁瓣在成品上要占 2~3px，所以这里的
+  // 内容必须比其他图标再小一圈（±66），否则最外一行/列会被旁瓣抬起而判"贴边"。
+  { id: 'icon_drop', cn: '掉落物', series: 'hai', w: 12, h: 12, sh: () => [
+    { k: 'glo', x: 0, y: 0, r: 68, c: 'A', a: 0.55 },
+    { k: 'poly', p: [[0, -66], [32, 0], [0, 66], [-32, 0]], f: 'A', s: 'K', lw: 10 },
+    { k: 'poly', p: [[0, -38], [17, 0], [0, 38], [-17, 0]], f: 'AH', s: null },
+    { k: 'dsc', x: 0, y: -12, r: 9, f: 'W', s: null },
+  ] },
+];
+
+// ---------------------------------------------------------------------------
+// 槽位登记表：必须与 src/assets/manifest.js 的 id / w / h 一致
+// ---------------------------------------------------------------------------
+const ICON_DEFS = ICON_WEAPONS.concat(ICON_PASSIVES, ICON_EXTRA);
+// ICON_SCALE：道具图标再统一内缩到 0.90。
+// 原因（实测，不是拍脑袋）：24px 的成品是先取 200×200 作画区、再用预乘 alpha 的
+// Lanczos 缩到 24，核半径换算到成品上是约 2~3px 的能量扩散。作图若顶到 ±100，
+// 内容虽然在 24px 里还有 2.4px 边距，但 Lanczos 的旁瓣会把边缘像素的 alpha 抬到 2~4，
+// 于是"四周 ≥1px 全透明"这条就挂了（实测 wuxianfu / shoujia 就是这种 0 边距）。
+// 缩到 0.90 后内容半径约 8.5px（成品 17~18px 见方、四周 2~3px 留白），旁瓣落回 0。
+const ICON_SCALE = 0.90;
+const ICON_SPRITES = ICON_DEFS.map((d) => ({
+  id: d.id, cn: d.cn, w: d.w || 24, h: d.h || 24, scale: ICON_SCALE,
+  draw: (ctx) => paintIcon(ctx, d.sh(), iconPal(d.series)),
+}));
+
+const SPRITES = [
+  { id: 'char_shanpo',       cn: '山魄',   w: 32,  h: 32,  draw: drawShanpo },
+  { id: 'char_haipo',        cn: '海魄',   w: 32,  h: 32,  draw: drawHaipo },
+  { id: 'char_huangpo',      cn: '荒魄',   w: 32,  h: 32,  draw: drawHuangpo },
+  { id: 'enemy_shanxiao',    cn: '山魈',   w: 28,  h: 28,  draw: drawShanxiao },
+  { id: 'enemy_bifang',      cn: '毕方',   w: 30,  h: 30,  draw: drawBifang },
+  { id: 'enemy_huashe',      cn: '化蛇',   w: 28,  h: 28,  draw: drawHuashe },
+  { id: 'enemy_xinang',      cn: '傒囊',   w: 26,  h: 26,  draw: drawXinang },
+  { id: 'enemy_qiangliang',  cn: '强良',   w: 36,  h: 36,  draw: drawQiangliang },
+  { id: 'boss_xiangliu',     cn: '相柳',   w: 132, h: 132, scale: 0.94, draw: drawXiangliu },
+
+  // ---- 批 2：第 4~6 系的玩家角色 ----
+  // 追加在数组末尾（批 1 的 9 个槽位索引不变 → 那 9 张图切片结果不变）。
+  // 12 个槽位 = 3 列 × 4 行 → 网格图 768×1024，build.ps1 会自动按这个尺寸开窗口。
+  { id: 'char_tianpo',       cn: '天魄',   w: 32,  h: 32,  draw: drawTianpo },
+  { id: 'char_wupo',         cn: '巫魄',   w: 32,  h: 32,  draw: drawWupo },
+  { id: 'char_busipo',       cn: '不死魄', w: 32,  h: 32,  draw: drawBusipo },
+
+  // ---- 批 3：51 个道具图标（24 武器 + 24 被动 + 通用被动 / 超武 / 掉落）----
+  // 同样追加在数组末尾：批 1/2 的 12 个槽位索引不变 → 那 12 张图切片结果不变。
+  // 51 + 12 = 63 个槽位 = 3 列 × 21 行 → 网格图 768×5376（build.ps1 自动算窗口尺寸）。
+  ...ICON_SPRITES,
+];
+
+// 网格参数（slice.py 里必须用同样的值）
+const CELL = 256;   // 单元格边长
+const ART = 200;    // 单元格内居中的作画正方形边长（4 倍超采样区）
+const COLS = 3;
+// PAD：在每个单元格内把画稿整体缩一圈。绘制函数按 ±100 设计，这里统一缩到 ±80，
+// 于是"至少 1px 透明边距"是构造出来的（不会被游戏裁掉）。改大 PAD 会更保守（精灵变小）。
+const PAD = 0.80;
+
+function renderSheet() {
+  const rows = Math.ceil(SPRITES.length / COLS);
+  const cv = document.getElementById('sheet');
+  cv.width = COLS * CELL;
+  cv.height = rows * CELL;
+  const ctx = cv.getContext('2d');
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+
+  SPRITES.forEach((sp, i) => {
+    const col = i % COLS, row = Math.floor(i / COLS);
+    const cellX = col * CELL, cellY = row * CELL;
+    ctx.save();
+    // 网格辅助线（很淡，仅便于人眼审图；切片时不会被取到，因为远离中心）
+    ctx.strokeStyle = 'rgba(255,255,255,0.10)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(cellX + 0.5, cellY + 0.5, CELL - 1, CELL - 1);
+    // 作画区：居中的 ART×ART 正方形，原点移到中心
+    ctx.translate(cellX + CELL / 2, cellY + CELL / 2);
+    // 角落标签（审图用；slice.py 按 ART 正方形取图，不会带进成品）
+    ctx.fillStyle = 'rgba(255,255,255,0.55)';
+    ctx.font = '13px monospace';
+    ctx.textBaseline = 'top';
+    ctx.fillText(`${sp.id}  ${sp.cn}  ${sp.w}x${sp.h}`, -CELL / 2 + 8, CELL / 2 - 22);
+    // 轻微裁剪保护：即使画超了也不会污染相邻单元格
+    ctx.save();
+    ctx.scale(PAD * (sp.scale || 1), PAD * (sp.scale || 1));   // 统一内缩，保证四周留白
+    const lim = ART / 2 / (PAD * (sp.scale || 1));
+    ctx.beginPath();
+    ctx.rect(-lim, -lim, lim * 2, lim * 2);
+    ctx.clip();
+    sp.draw(ctx);
+    ctx.restore();
+    ctx.restore();
+  });
+
+  // 供 slice.py / 人工核对
+  window.__SPRITE_SHEET__ = { cell: CELL, art: ART, cols: COLS, sprites: SPRITES.map(s => ({ id: s.id, cn: s.cn, w: s.w, h: s.h })) };
+  document.title = 'ready:' + SPRITES.length;
+}
+renderSheet();
+</script>
+</body>
+</html>

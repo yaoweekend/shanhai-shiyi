@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#0b0a0e">
+<meta name="description" content="山海拾遗 —— 手机端弹幕天堂肉鸽。严格不联网的单机网页游戏。">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>山海拾遗</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="assets/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="src/ui/styles.css">
+</head>
+<body>
+<div id="bootfail" class="screen" hidden></div>
+<canvas id="game" aria-label="游戏画面"></canvas>
+
+<!-- ================= 主菜单 ================= -->
+<div id="screen-menu" class="screen menu-screen" hidden>
+  <div class="menu-inner">
+    <header class="brand">
+      <h1>山海拾遗</h1>
+      <p class="tagline">手机横屏 · 单手走位 · 自动开火 · 一局 8~12 分钟</p>
+    </header>
+
+    <section class="panel">
+      <h2>选择角色</h2>
+      <div id="char-list" class="char-list"></div>
+    </section>
+
+    <section class="panel">
+      <h2>本机记录</h2>
+      <div id="highscore" class="highscore"></div>
+    </section>
+
+    <nav class="menu-actions">
+      <button id="btn-start" class="primary">开始一局</button>
+      <button id="btn-continue" hidden>接着上一局</button>
+      <button id="btn-endless" hidden>无尽模式</button>
+      <button id="btn-trials">试炼</button>
+      <button id="btn-codex">图鉴</button>
+      <button id="btn-settings">设置</button>
+      <button id="btn-about">关于 / 许可</button>
+    </nav>
+    <p class="muted small">本游戏严格不联网：运行期间不发出任何网络请求，没有广告、内购、排行榜与账号。</p>
+  </div>
+</div>
+
+<!-- ================= 局内 HUD 覆盖层（摇杆与按钮由 Canvas 绘制） ================= -->
+<div id="screen-hud" class="screen hud-screen" hidden>
+  <button id="btn-pause" class="hud-pause" aria-label="暂停">❚❚</button>
+  <div id="hud-hint" class="hud-hint" hidden></div>
+</div>
+
+<!-- ================= 暂停 ================= -->
+<div id="screen-pause" class="screen modal-screen" hidden>
+  <div class="modal scroll">
+    <h2>暂停</h2>
+    <div id="pause-loadout" class="loadout"></div>
+    <div class="modal-actions">
+      <button id="btn-resume" class="primary">继续</button>
+      <button id="btn-savequit">保存并退出</button>
+      <button id="btn-quit">放弃本局</button>
+    </div>
+    <p class="muted small">保存并退出后，下次进入主菜单会出现「接着上一局」。</p>
+  </div>
+</div>
+
+<!-- ================= 三选一升级 ================= -->
+<div id="screen-levelup" class="screen modal-screen" hidden>
+  <div class="levelup">
+    <h2>提升</h2>
+    <p class="muted" id="levelup-sub"></p>
+    <div id="cards" class="cards"></div>
+    <div class="levelup-actions">
+      <button id="btn-refresh">刷新（剩 1 次）</button>
+      <p class="muted small" id="levelup-hint">三张里选一张。刷新每局只有一次，不能跳过。</p>
+    </div>
+  </div>
+</div>
+
+<!-- ================= 结算 ================= -->
+<div id="screen-result" class="screen modal-screen" hidden>
+  <div class="modal wide scroll">
+    <h2 id="result-title">结算</h2>
+    <div id="result-body" class="result-body"></div>
+    <div id="result-trials" class="result-trials"></div>
+    <div class="modal-actions actions-row">
+      <button id="btn-endless2" hidden>继续无尽</button>
+      <button id="btn-again" class="primary">再来一局</button>
+      <button id="btn-tomenu">回主菜单</button>
+    </div>
+  </div>
+</div>
+
+<!-- ================= 试炼 ================= -->
+<div id="screen-trials" class="screen modal-screen" hidden>
+  <div class="modal wide scroll">
+    <h2>试炼</h2>
+    <p class="muted small">解锁只解锁内容，不给任何数值加成。</p>
+    <div id="trials-body" class="trials-body"></div>
+    <div class="modal-actions"><button class="back" data-back>返回</button></div>
+  </div>
+</div>
+
+<!-- ================= 图鉴 ================= -->
+<div id="screen-codex" class="screen modal-screen" hidden>
+  <div class="modal wide scroll">
+    <h2>图鉴</h2>
+    <p class="muted small">按神系分卷，记录「见过」而不是「持有」。</p>
+    <div id="codex-body" class="codex-body"></div>
+    <div class="modal-actions"><button class="back" data-back>返回</button></div>
+  </div>
+</div>
+
+<!-- ================= 设置 ================= -->
+<div id="screen-settings" class="screen modal-screen" hidden>
+  <div class="modal scroll">
+    <h2>设置</h2>
+    <div id="settings-body" class="settings-body"></div>
+    <div class="modal-actions">
+      <button class="back" data-back>返回</button>
+      <button id="btn-wipe" class="danger">清空本机进度</button>
+    </div>
+  </div>
+</div>
+
+<!-- ================= 关于 / 许可（上架硬门槛） ================= -->
+<div id="screen-about" class="screen modal-screen" hidden>
+  <div class="modal wide scroll">
+    <h2>关于 / 许可</h2>
+    <div id="about-body" class="about-body"></div>
+    <div class="modal-actions"><button class="back" data-back>返回</button></div>
+  </div>
+</div>
+
+<!-- ================= 隐私政策（上架硬门槛，需一个可公开访问的 URL） ================= -->
+<div id="screen-privacy" class="screen modal-screen" hidden>
+  <div class="modal wide scroll">
+    <h2>隐私政策</h2>
+    <div id="privacy-body" class="about-body"></div>
+    <div class="modal-actions"><button class="back" data-back>返回</button></div>
+  </div>
+</div>
+
+<script type="module" src="src/main.js"></script>
+</body>
+</html>
